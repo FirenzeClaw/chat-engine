@@ -37,6 +37,10 @@ logger.setLevel(logging.INFO)
 
 session_manager = SessionManager()
 
+# 模块级单例 AsyncOpenAI 实例（并发复用，减少连接开销）
+_fast_client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+_strong_client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+
 
 # ==================== Context Assembly ====================
 
@@ -168,11 +172,9 @@ async def _llm_extract_keywords(content: str) -> list[str]:
 输出 JSON 格式:
 {{"keywords": ["词1","词2"], "topic_tags": ["标签1"], "resolved_entities": {{"他":"张三"}}}}"""
 
-    client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     try:
-        import json
         response = await asyncio.wait_for(
-            client.chat.completions.create(
+            _fast_client.chat.completions.create(
                 model=LLM_FAST_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=128,
@@ -387,9 +389,16 @@ async def startup():
 
 
 async def shutdown():
-    """优雅关闭：保存所有会话。"""
+    """优雅关闭：保存所有会话，停止调度器。"""
     n = session_manager.save()
     logger.info("已关闭，保存 %d 个会话", n)
+
+    try:
+        from reply_scheduler import get_scheduler
+        scheduler = get_scheduler()
+        await scheduler.stop()
+    except Exception:
+        pass
 
 
 # ==================== Core API ====================
@@ -439,12 +448,12 @@ async def chat(
     # 存入 session 的是原始消息（纯净文本，不含记忆索引）
     session.add_message("user", user_message)
 
-    client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    api_client = _strong_client if role == "strong" else _fast_client
     model = LLM_STRONG_MODEL if role == "strong" else LLM_FAST_MODEL
 
     try:
         response = await asyncio.wait_for(
-            client.chat.completions.create(
+            api_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,

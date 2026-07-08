@@ -55,6 +55,31 @@ MAX_RETRIEVAL_RESULTS = int(os.getenv("MAX_RETRIEVAL_RESULTS", "5"))
 CLUSTER_TRIGGER_DAYS = int(os.getenv("CLUSTER_TRIGGER_DAYS", "14"))
 CLUSTER_TRIGGER_MIN_ACCESS = int(os.getenv("CLUSTER_TRIGGER_MIN_ACCESS", "3"))
 
+# --- Spec 002: 回复调度器 ---
+# 私聊防抖窗口（秒）
+REPLY_WAIT_PRIVATE_MIN = int(os.getenv("REPLY_WAIT_PRIVATE_MIN", "3"))
+REPLY_WAIT_PRIVATE_MAX = int(os.getenv("REPLY_WAIT_PRIVATE_MAX", "8"))
+# 群聊等待窗口（秒）
+REPLY_WAIT_GROUP_MIN = int(os.getenv("REPLY_WAIT_GROUP_MIN", "15"))
+REPLY_WAIT_GROUP_MAX = int(os.getenv("REPLY_WAIT_GROUP_MAX", "60"))
+# 群聊随机插话窗口（秒）
+REPLY_CHIME_IN_MIN = int(os.getenv("REPLY_CHIME_IN_MIN", "120"))
+REPLY_CHIME_IN_MAX = int(os.getenv("REPLY_CHIME_IN_MAX", "360"))
+REPLY_CHIME_IN_SPEAKERS = int(os.getenv("REPLY_CHIME_IN_SPEAKERS", "2"))
+# 冷却时间（秒）
+REPLY_COOLDOWN_PRIVATE = int(os.getenv("REPLY_COOLDOWN_PRIVATE", "5"))
+REPLY_COOLDOWN_GROUP = int(os.getenv("REPLY_COOLDOWN_GROUP", "30"))
+# Actor/缓冲上限
+REPLY_MAX_BUFFER = int(os.getenv("REPLY_MAX_BUFFER", "20"))
+REPLY_MAX_ACTORS = int(os.getenv("REPLY_MAX_ACTORS", "50"))
+# 焦虑词触发列表（逗号分隔）
+REPLY_ANXIETY_TRIGGERS = os.getenv("REPLY_ANXIETY_TRIGGERS", "在吗,在不在,在在在,？？？,人呢,哈喽,hello")
+# ThinkingGate 并发与速率限制
+THINKING_MAX_CONCURRENT = int(os.getenv("THINKING_MAX_CONCURRENT", "3"))
+THINKING_RATE_LIMIT = int(os.getenv("THINKING_RATE_LIMIT", "20"))
+THINKING_QUEUE_TIMEOUT_P3 = int(os.getenv("THINKING_QUEUE_TIMEOUT_P3", "5"))
+THINKING_QUEUE_TIMEOUT_P4 = int(os.getenv("THINKING_QUEUE_TIMEOUT_P4", "10"))
+
 # --- Follow-up ---
 FOLLOW_UP_ENABLED = os.getenv("FOLLOW_UP_ENABLED", "true").lower() == "true"
 FOLLOW_UP_MAX_PER_HOUR = int(os.getenv("FOLLOW_UP_MAX_PER_HOUR", "5"))  # 每小时最多追答数

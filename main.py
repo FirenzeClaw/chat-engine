@@ -179,6 +179,11 @@ async def main():
     from engine import startup
     await startup()
 
+    # 初始化回复调度器
+    from reply_scheduler import get_scheduler
+    scheduler = get_scheduler()
+    await scheduler.start()
+
     # 创建 HTTP 应用
     app = web.Application()
 

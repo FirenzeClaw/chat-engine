@@ -41,7 +41,7 @@
 IDLE → [enqueue] → WAITING
 WAITING → [timeout | anxiety | chime | @] → QUEUED
 QUEUED → [acquired] → THINKING
-QUEUED → [timeout] → WAITING (reset)
+QUEUED → [timeout] → COOLDOWN (丢弃 buffer，防止紧循环重试)
 THINKING → [reply sent] → COOLDOWN
 COOLDOWN → [expired + buffer empty] → IDLE
 COOLDOWN → [expired + buffer has messages] → WAITING

@@ -2,19 +2,17 @@
 QQ Bot 消息协调器 — chat-engine 独立版
 
 直接将 QQ 消息流入 chat-engine，不经过 HTTP。
-使用 engine.chat() 快速回复，brain.evaluate() 异步评估。
+使用 reply_scheduler 管理回复节奏（私聊防抖 + 群聊频率 + 优先级队列）。
 
 职责：
-- 消息路由（QQ → engine → QQ）
-- 异步评估调度
-- 对话摘要保存到 memory_store
+- 消息路由（QQ → reply_scheduler / 被动观察）
+- 已委托 reply_scheduler 处理 engine.chat() + brain.evaluate() + 追答
 - **不负责 prompt 拼装**（上下文组装由 engine 内部完成）
 """
 
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime, timezone
 
 logger = logging.getLogger("orch")
@@ -30,7 +28,7 @@ async def process_qq_message(
     msg_metadata: dict,
     send_reply,
 ) -> str:
-    """处理 QQ 消息：快速回复 + 异步评估。
+    """处理 QQ 消息：委托 reply_scheduler 管理回复节奏。
 
     Args:
         user_id: QQ openid
@@ -39,163 +37,32 @@ async def process_qq_message(
         send_reply: async callable(reply_dict) — 发送 QQ 消息的回调
 
     Returns:
-        快速回复文本。群聊普通消息返回空字符串（跳过回复）。
+        空字符串（回复由 scheduler 异步处理）。
     """
     msg_type = msg_metadata.get("msg_type", "")
     is_group = "GROUP" in msg_type
     is_at = "AT_MESSAGE" in msg_type
     is_direct = "DIRECT" in msg_type or "C2C" in msg_type
 
-    # 群聊普通消息：仅记录，不回复（避免噪音/延迟/成本）
+    # 群聊普通消息：仅旁听记录，不回复（避免噪音/延迟/成本）
     if is_group and not is_at and not is_direct:
         logger.debug("群聊普通消息，跳过回复: type=%s", msg_type)
         asyncio.create_task(_passive_observe(user_id, content, msg_metadata))
-        return ""
-
-    # 1. 辅脑快速回复（engine 内部自动组装 persona + 记忆索引）
-    t_start = time.monotonic()
-    try:
-        result = await _chat_via_engine(
-            session_id=user_id,
-            user_message=content,
-        )
-        fast_reply = result["reply"]
-    except Exception as e:
-        fast_reply = f"[错误] 辅脑不可用: {e}"
-    latency_ms = int((time.monotonic() - t_start) * 1000)
-    logger.info("辅脑回复: %dms, type=%s", latency_ms, msg_type)
-    if latency_ms > 500:
-        logger.warning("辅脑回复延迟超标: %dms (SLO: <500ms)", latency_ms)
-
-    # 2. 立即发送
-    reply_data = {
-        "type": "reply",
-        "user_id": user_id,
-        "content": fast_reply,
-        "group_id": msg_metadata.get("group_id", ""),
-        "channel_id": msg_metadata.get("channel_id", ""),
-        "guild_id": msg_metadata.get("guild_id", ""),
-        "ref_msg_id": msg_metadata.get("ref_msg_id", ""),
-        "msg_type": msg_metadata.get("msg_type", ""),
-    }
-    try:
-        await send_reply(reply_data)
-    except Exception:
-        logger.exception("发送快速回复失败")
-
-    # 3. 异步评估 + 追答
-    asyncio.create_task(_async_handle(
-        user_id, content, fast_reply, send_reply, msg_metadata
-    ))
-
-    # 4. 保存对话摘要到 memory_store（含场景标记）
-    try:
-        from memory_store import set as mem_set
-
-        # 提取场景信息
-        msg_type = msg_metadata.get("msg_type", "")
-        if "GROUP" in msg_type:
-            source = "group"
-            gid = msg_metadata.get("group_id", "")
-        else:
-            source = "private"
-            gid = None
-
-        summary = {
-            "date": datetime.now(timezone.utc).isoformat(),
-            "summary": f"用户: {content[:100]}; 回复: {fast_reply[:100]}",
-            "topics": [],
-            "message_count": 1,
-            "source": source,
-            "group_id": gid,
-            "linked_private_session": None,
-            "linked_group_session": None,
-        }
-        await mem_set(
-            f"user/{user_id}/conversations",
-            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
-            json.dumps(summary, ensure_ascii=False),
-            source=source,
-            group_id=gid,
-            participants=json.dumps([user_id]),
-        )
-    except Exception:
-        pass
-
-    return fast_reply
-
-
-async def _chat_via_engine(session_id: str, user_message: str) -> dict:
-    """调用 engine.chat()，engine 内部自动组装上下文。"""
-    from engine import chat
-    return await chat(
-        session_id=session_id,
-        user_message=user_message,
-    )
-
-
-async def _async_handle(user_id, content, fast_reply, send_reply, msg_metadata):
-    """异步评估 + 追答。"""
-    try:
-        from brain import evaluate as brain_eval
-
-        # 获取 persona 用于评估
-        persona_text = ""
+        # 记录发言人供频率分析用
         try:
-            from memory_store import get as mem_get
-            entry = await mem_get("global/persona", "core")
-            if entry:
-                persona_text = entry["value"]
+            from reply_scheduler import get_scheduler
+            await get_scheduler().record_group_speaker(
+                msg_metadata.get("group_id", ""), user_id
+            )
         except Exception:
             pass
+        return ""
 
-        decision = await brain_eval(
-            session_id=user_id,
-            user_message=content,
-            fast_reply=fast_reply,
-            system_prompt=persona_text,
-        )
-
-        if decision.get("should_follow_up"):
-            follow_up_text = decision.get("follow_up_text", "")
-            if follow_up_text:
-                fu_data = {
-                    "type": "reply",
-                    "user_id": user_id,
-                    "content": follow_up_text,
-                    "group_id": msg_metadata.get("group_id", ""),
-                    "channel_id": msg_metadata.get("channel_id", ""),
-                    "guild_id": msg_metadata.get("guild_id", ""),
-                    "ref_msg_id": msg_metadata.get("ref_msg_id", ""),
-                    "msg_type": msg_metadata.get("msg_type", ""),
-                }
-                await send_reply(fu_data)
-                logger.info("追答已发送: %s", user_id)
-
-        # 记忆更新
-        salience_score = decision.get("salience_score")
-        for update in decision.get("memory_updates", []):
-            try:
-                action = update.get("action", "")
-                ns = update.get("namespace", "")
-                k = update.get("key", "")
-                if not ns or not k:
-                    continue
-                from memory_store import set as mem_set, mark_expired, correct_entry
-                if action == "expire":
-                    await mark_expired(ns, k)
-                elif action == "correct":
-                    new_val = update.get("new_value", update.get("value", ""))
-                    reason = update.get("reason", "brain correction")
-                    await correct_entry(ns, k, new_val if isinstance(new_val, str) else json.dumps(new_val, ensure_ascii=False), reason)
-                elif action in ("add", "update"):
-                    v = update.get("value", "")
-                    await mem_set(ns, k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False),
-                                  salience=salience_score)
-            except Exception:
-                pass
-    except Exception:
-        logger.exception("异步评估失败")
+    # 私聊 / @ / C2C → 委托 reply_scheduler
+    from reply_scheduler import get_scheduler
+    scheduler = get_scheduler()
+    await scheduler.enqueue(user_id, content, msg_metadata, send_reply)
+    return ""
 
 
 async def _passive_observe(user_id: str, content: str, msg_metadata: dict) -> None:
