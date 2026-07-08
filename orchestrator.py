@@ -39,8 +39,19 @@ async def process_qq_message(
         send_reply: async callable(reply_dict) — 发送 QQ 消息的回调
 
     Returns:
-        快速回复文本
+        快速回复文本。群聊普通消息返回空字符串（跳过回复）。
     """
+    msg_type = msg_metadata.get("msg_type", "")
+    is_group = "GROUP" in msg_type
+    is_at = "AT_MESSAGE" in msg_type
+    is_direct = "DIRECT" in msg_type or "C2C" in msg_type
+
+    # 群聊普通消息：仅记录，不回复（避免噪音/延迟/成本）
+    if is_group and not is_at and not is_direct:
+        logger.debug("群聊普通消息，跳过回复: type=%s", msg_type)
+        asyncio.create_task(_passive_observe(user_id, content, msg_metadata))
+        return ""
+
     # 1. 辅脑快速回复（engine 内部自动组装 persona + 记忆索引）
     t_start = time.monotonic()
     try:
@@ -52,7 +63,7 @@ async def process_qq_message(
     except Exception as e:
         fast_reply = f"[错误] 辅脑不可用: {e}"
     latency_ms = int((time.monotonic() - t_start) * 1000)
-    logger.info("辅脑回复: %dms", latency_ms)
+    logger.info("辅脑回复: %dms, type=%s", latency_ms, msg_type)
     if latency_ms > 500:
         logger.warning("辅脑回复延迟超标: %dms (SLO: <500ms)", latency_ms)
 
@@ -185,6 +196,35 @@ async def _async_handle(user_id, content, fast_reply, send_reply, msg_metadata):
                 pass
     except Exception:
         logger.exception("异步评估失败")
+
+
+async def _passive_observe(user_id: str, content: str, msg_metadata: dict) -> None:
+    """被动观察模式：群聊普通消息不做回复，仅记录到记忆系统。
+
+    让 Bot 作为一个"旁听者"积累对群成员和话题的了解，
+    在被 @ 时才能基于这些背景记忆做出更贴切的回复。
+    """
+    try:
+        from memory_store import set as mem_set
+        gid = msg_metadata.get("group_id", "")
+        summary = json.dumps({
+            "date": datetime.now(timezone.utc).isoformat(),
+            "summary": f"[群聊观察] {content[:100]}",
+            "topics": [],
+            "source": "group",
+            "group_id": gid,
+        }, ensure_ascii=False)
+        await mem_set(
+            f"user/{user_id}/conversations",
+            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+            summary,
+            source="group",
+            group_id=gid,
+            participants=json.dumps([user_id]),
+        )
+        logger.debug("被动观察已记录: %s, %s", user_id[:12], content[:30])
+    except Exception:
+        pass
 
 
 async def init_memory():
