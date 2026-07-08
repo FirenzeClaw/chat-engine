@@ -181,6 +181,7 @@ class ReplyScheduler:
                 _auto_search_counter += 1
                 if _auto_search_counter >= 60:
                     _auto_search_counter = 0
+                    logger.debug("background_tick: 心跳, actors=%d", len(self._actors))
                     await self._try_auto_search()
                     await self._try_boredom_check(now)
 
@@ -190,6 +191,7 @@ class ReplyScheduler:
             except Exception:
                 logger.exception("background_tick 异常")
                 await asyncio.sleep(5)
+        logger.info("background_tick: 已退出")
 
     async def _try_auto_search(self) -> None:
         try:
@@ -198,6 +200,7 @@ class ReplyScheduler:
                 from personality import get_personality
                 p = get_personality()
                 if not p.should_search():
+                    logger.info("auto_search: 个性决策跳过 (curiosity=%.1f)", p.weights.curiosity)
                     return
             except (ImportError, Exception):
                 return
@@ -217,6 +220,7 @@ class ReplyScheduler:
                 from personality import get_personality
                 p = get_personality()
                 if not p.should_be_bored():
+                    logger.info("boredom: 个性决策跳过 (impulsiveness=%.1f)", p.weights.impulsiveness)
                     return
             except (ImportError, Exception):
                 pass
