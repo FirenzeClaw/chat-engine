@@ -74,6 +74,10 @@ async def _run_migration() -> None:
         await _migrate_v2(db)
         current = 2
 
+    # 约束修复：无论版本号，每次都检查并修复 UNIQUE 约束
+    # （因为表重建在旧 DB 上可能因数据量大而失败，需要多次重试）
+    await _ensure_partial_unique_index(db)
+
     _migration_version = current
     logger.info("Schema 迁移完成，当前版本: v%d", _migration_version)
 
@@ -112,53 +116,7 @@ async def _migrate_v2(db: aiosqlite.Connection) -> None:
             pass  # column already exists, idempotent
 
     # --- 替换 UNIQUE(namespace, key) 为部分唯一索引 ---
-    # 原 UNIQUE(namespace, key) 阻止同 namespace+key 的多版本（纠正链需要）
-    # 新方案: 仅在 corrected=0 AND expired=0 时保证唯一
-    try:
-        # 检查旧约束是否存在
-        cursor = await db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'"
-        )
-        row = await cursor.fetchone()
-        if row and "UNIQUE(namespace, key)" in (row[0] or ""):
-            # 重建表移除 UNIQUE 约束
-            await db.execute("ALTER TABLE entries RENAME TO entries_old")
-            await db.execute("""
-                CREATE TABLE entries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    version INTEGER DEFAULT 1,
-                    expired INTEGER DEFAULT 0,
-                    access_count INTEGER DEFAULT 0,
-                    last_access TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-            """)
-            # 复制数据
-            cursor = await db.execute("SELECT * FROM entries_old")
-            old_rows = await cursor.fetchall()
-            for r in old_rows:
-                rd = dict(r)
-                await db.execute(
-                    """INSERT INTO entries (id, namespace, key, value, version, expired,
-                       access_count, last_access, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (rd["id"], rd["namespace"], rd["key"], rd["value"],
-                     rd["version"], rd["expired"], rd["access_count"],
-                     rd["last_access"], rd["created_at"], rd["updated_at"]),
-                )
-            await db.execute("DROP TABLE entries_old")
-            logger.info("UNIQUE(namespace,key) constraint removed for correction chain support")
-    except Exception:
-        pass  # table already without old constraint
-
-    # 创建部分唯一索引（仅对活跃条目保证唯一）
-    await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_active_entry ON entries(namespace, key) WHERE corrected=0 AND expired=0"
-    )
+    await _ensure_partial_unique_index(db)
 
     # --- memory_links 表 ---
     await db.execute("""
@@ -239,6 +197,100 @@ async def _migrate_v2(db: aiosqlite.Connection) -> None:
     )
     await db.commit()
     logger.info("迁移 v2 完成: 新增 15 列 + 4 表")
+
+
+async def _ensure_partial_unique_index(db: aiosqlite.Connection) -> None:
+    """确保 entries 表使用部分唯一索引代替 UNIQUE 约束。
+
+    每次 init 时调用，幂等——检查旧约束是否存在，存在则重建表。
+    新 DB（init() 中已无 UNIQUE）直接跳过。
+    """
+    try:
+        # 检查旧约束是否存在
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'"
+        )
+        row = await cursor.fetchone()
+        if row and "UNIQUE(namespace, key)" in (row[0] or ""):
+            logger.info("检测到旧 UNIQUE(namespace,key) 约束，正在重建表...")
+            # 重建表移除 UNIQUE 约束
+            await db.execute("ALTER TABLE entries RENAME TO entries_old")
+            await db.execute("""
+                CREATE TABLE entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    version INTEGER DEFAULT 1,
+                    expired INTEGER DEFAULT 0,
+                    access_count INTEGER DEFAULT 0,
+                    last_access TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    memory_layer TEXT DEFAULT 'gist',
+                    decay_curve TEXT DEFAULT 'standard',
+                    decay_start TEXT,
+                    auto_migrate INTEGER DEFAULT 0,
+                    salience REAL DEFAULT 0,
+                    corrected INTEGER DEFAULT 0,
+                    superseded_by INTEGER DEFAULT NULL,
+                    correction_reason TEXT DEFAULT NULL,
+                    entity_type TEXT DEFAULT NULL,
+                    topic_tags TEXT DEFAULT NULL,
+                    about_person TEXT DEFAULT NULL,
+                    source TEXT DEFAULT 'private',
+                    group_id TEXT DEFAULT NULL,
+                    participants TEXT DEFAULT NULL,
+                    emotion_at_encoding TEXT DEFAULT NULL
+                )
+            """)
+            # 复制数据（使用 LIMIT 分批避免大表超时）
+            offset = 0
+            batch_size = 1000
+            total = 0
+            while True:
+                cursor = await db.execute(
+                    "SELECT * FROM entries_old LIMIT ? OFFSET ?",
+                    (batch_size, offset),
+                )
+                batch = await cursor.fetchall()
+                if not batch:
+                    break
+                for r in batch:
+                    rd = dict(r)
+                    await db.execute(
+                        """INSERT INTO entries (id, namespace, key, value, version, expired,
+                           access_count, last_access, created_at, updated_at,
+                           memory_layer, decay_curve, decay_start, auto_migrate,
+                           salience, corrected, superseded_by, correction_reason,
+                           entity_type, topic_tags, about_person, source, group_id,
+                           participants, emotion_at_encoding)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   ?, ?, ?, ?, ?, ?, ?, ?,
+                                   ?, ?, ?, ?, ?, ?, ?)""",
+                        (rd["id"], rd["namespace"], rd["key"], rd["value"],
+                         rd["version"], rd["expired"], rd["access_count"],
+                         rd["last_access"], rd["created_at"], rd["updated_at"],
+                         rd.get("memory_layer", "gist"), rd.get("decay_curve", "standard"),
+                         rd.get("decay_start"), rd.get("auto_migrate", 0),
+                         rd.get("salience", 0), rd.get("corrected", 0),
+                         rd.get("superseded_by"), rd.get("correction_reason"),
+                         rd.get("entity_type"), rd.get("topic_tags"),
+                         rd.get("about_person"), rd.get("source", "private"),
+                         rd.get("group_id"), rd.get("participants"),
+                         rd.get("emotion_at_encoding")),
+                    )
+                    total += 1
+                offset += batch_size
+            await db.execute("DROP TABLE entries_old")
+            logger.info("表重建完成: %d 条记录已迁移", total)
+    except Exception as e:
+        logger.warning("部分唯一索引检查/修复失败: %s", e)
+
+    # 创建部分唯一索引（幂等）
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_active_entry ON entries(namespace, key) WHERE corrected=0 AND expired=0"
+    )
 
 
 async def init(db_path: str = "") -> None:
@@ -905,6 +957,7 @@ async def _spreading_activation(
     Returns:
         扩展后的 selected 列表
     """
+    now = datetime.now(timezone.utc).isoformat()
     if not selected:
         return selected
 
