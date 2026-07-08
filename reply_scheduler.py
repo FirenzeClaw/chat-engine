@@ -321,8 +321,8 @@ class ReplyScheduler:
             try:
                 # === IDLE: 等待首次消息 ===
                 actor.state = ActorState.IDLE
-                actor.event.clear()
                 await actor.event.wait()
+                actor.event.clear()
 
                 while actor.buffer:
                     # === 确定等待窗口 ===
@@ -354,13 +354,13 @@ class ReplyScheduler:
                         wait_until = time.monotonic() + random.uniform(wait_min, wait_max)
 
                         while time.monotonic() < wait_until:
-                            actor.event.clear()
                             remaining = wait_until - time.monotonic()
                             if remaining <= 0:
                                 break
                             try:
                                 await asyncio.wait_for(actor.event.wait(), timeout=remaining)
                                 # 新消息到达 → 重置等待窗口
+                                actor.event.clear()
                                 wait_until = time.monotonic() + random.uniform(wait_min, wait_max)
                                 trigger = actor._trigger_reason
                                 # 检查是否因焦虑/@ 应跳过等待
@@ -412,7 +412,6 @@ class ReplyScheduler:
 
                     # === COOLDOWN: 冷却期 ===
                     actor.priority = Priority.P4_NORMAL  # 重置为最低优先级
-                    actor.event.clear()
                     c_start = time.monotonic()
                     while time.monotonic() - c_start < cooldown_sec:
                         remaining = cooldown_sec - (time.monotonic() - c_start)
@@ -421,6 +420,7 @@ class ReplyScheduler:
                         try:
                             await asyncio.wait_for(actor.event.wait(), timeout=remaining)
                             # 有新消息 → 冷却期间积累到 buffer，冷却后继续 WAITING
+                            actor.event.clear()
                             if actor._trigger_reason == "at":
                                 break  # @ 打断冷却
                         except asyncio.TimeoutError:
