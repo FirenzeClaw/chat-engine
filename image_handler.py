@@ -26,7 +26,7 @@ import aiohttp
 from json_utils import parse_json_block
 
 from config import (
-    LLM_API_KEY, LLM_BASE_URL, LLM_FAST_MODEL,
+    LLM_API_KEY, LLM_BASE_URL, LLM_FAST_MODEL, LLM_STRONG_MODEL,
     IMAGE_MAX_SIZE_MB, IMAGE_STORAGE_DIR,
 )
 
@@ -101,7 +101,7 @@ async def classify_and_describe(image_data: bytes, content_type: str = "image/jp
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model=LLM_FAST_MODEL,
+                model=LLM_STRONG_MODEL,
                 messages=[
                     {"role": "system", "content": _CLASSIFICATION_PROMPT},
                     {
@@ -115,7 +115,7 @@ async def classify_and_describe(image_data: bytes, content_type: str = "image/jp
                 max_tokens=1000,
                 temperature=0.3,
             ),
-            timeout=10.0,
+            timeout=20.0,
         )
         raw = response.choices[0].message.content or ""
         finish = response.choices[0].finish_reason

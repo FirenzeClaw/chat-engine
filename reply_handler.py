@@ -82,21 +82,26 @@ async def handle_reply(actor) -> None:
 
         # Step 2: 图片消息 → 辅脑秒回 + 主脑异步看图
         if image_urls:
-            try:
-                fast_result = await engine_chat(
-                    session_id=raw_uid,
-                    user_message=combined_text or "对方发了一张图片",
-                    role="fast",
-                    temperature=0.8,
-                    max_tokens=128,
-                    image_urls=None,
-                )
-                fast_reply = fast_result["reply"]
-                if not fast_reply.startswith("[SKIP]") and not fast_reply.startswith("[SEARCH:"):
-                    await _send(fast_reply)
-                    logger.info("辅脑秒回: %s", fast_reply[:40])
-            except Exception:
+            # 纯图片（无文字）：跳过辅脑，直接用硬编码回复，避免推理模型输出思考内容
+            if not combined_text or not combined_text.strip():
                 await _send("收到图片啦，让我看看～")
+            else:
+                # 有文字 + 图片：辅脑回复文字内容（不带图片）
+                try:
+                    fast_result = await engine_chat(
+                        session_id=raw_uid,
+                        user_message=combined_text,
+                        role="fast",
+                        temperature=0.8,
+                        max_tokens=128,
+                        image_urls=None,
+                    )
+                    fast_reply = fast_result["reply"]
+                    if not fast_reply.startswith("[SKIP]") and not fast_reply.startswith("[SEARCH:"):
+                        await _send(fast_reply)
+                        logger.info("辅脑秒回: %s", fast_reply[:40])
+                except Exception:
+                    await _send("收到图片啦，让我看看～")
 
             async def _main_brain_reply():
                 try:
