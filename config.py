@@ -19,6 +19,8 @@ LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", os.getenv("LLM_MODEL", "deepseek-ch
 # 主脑：强推理，用于评估/追答生成
 LLM_STRONG_MODEL = os.getenv("LLM_STRONG_MODEL", os.getenv("LLM_MODEL", "deepseek-chat"))
 LLM_MODEL = LLM_FAST_MODEL
+# 推理强度（step-3.7-flash 等推理模型支持: low/medium/high）
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "")
 
 # --- QQ Bot ---
 QQ_BOT_APPID = os.getenv("QQ_BOT_APPID", "")

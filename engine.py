@@ -25,7 +25,7 @@ from openai import AsyncOpenAI
 
 from config import (
     LLM_API_KEY, LLM_BASE_URL, LLM_FAST_MODEL, LLM_STRONG_MODEL,
-    DEFAULT_SYSTEM_PROMPT, MAX_CONTEXT_TOKENS,
+    DEFAULT_SYSTEM_PROMPT, MAX_CONTEXT_TOKENS, LLM_REASONING_EFFORT,
 )
 from session import Session, SessionManager
 
@@ -452,13 +452,19 @@ async def chat(
     model = LLM_STRONG_MODEL if role == "strong" else LLM_FAST_MODEL
 
     try:
+        # 构建 API 参数
+        api_kwargs = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        # step 模型支持 reasoning_effort (low/medium/high)
+        if LLM_REASONING_EFFORT:
+            api_kwargs["reasoning_effort"] = LLM_REASONING_EFFORT
+
         response = await asyncio.wait_for(
-            api_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ),
+            api_client.chat.completions.create(**api_kwargs),
             timeout=30,
         )
         reply = response.choices[0].message.content or ""
