@@ -36,6 +36,15 @@ logger.setLevel(logging.INFO)
 _db: Optional[aiosqlite.Connection] = None
 _db_path: str = ""
 _migration_version: int = 0  # schema version, bumped on each migration
+_key_locks: dict[str, asyncio.Lock] = {}  # per-namespace+key concurrency guard
+
+
+def _lock_key(namespace: str, key: str) -> asyncio.Lock:
+    """获取指定 namespace+key 的锁，不存在则创建。"""
+    lock_key = f"{namespace}//{key}"
+    if lock_key not in _key_locks:
+        _key_locks[lock_key] = asyncio.Lock()
+    return _key_locks[lock_key]
 
 
 async def _run_migration() -> None:
@@ -327,6 +336,21 @@ async def set(
         participants: JSON array of user_ids
         salience: 重要性评分 0-10 (Phase 1)
     """
+    async with _lock_key(namespace, key):
+        return await _set_impl(namespace, key, value, expire, source, group_id, participants, salience)
+
+
+async def _set_impl(
+    namespace: str,
+    key: str,
+    value: str,
+    expire: bool = False,
+    source: str = "private",
+    group_id: Optional[str] = None,
+    participants: Optional[str] = None,
+    salience: Optional[float] = None,
+) -> int:
+    """set() 的实际实现（调用方需先获取锁）。"""
     db = await _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -913,6 +937,11 @@ async def _spreading_activation(
                     linked_entry = dict(row)
                     linked_entry["_relevance"] = link["strength"] * 0.5
                     linked_memories[linked_id] = linked_entry
+                    # 记录扩散访问到 access_log
+                    await db.execute(
+                        "INSERT INTO access_log (entry_id, accessed_at, context) VALUES (?, ?, 'spreading')",
+                        (linked_id, now),
+                    )
 
     # 标记链接关系
     for m in selected:
@@ -939,6 +968,7 @@ async def _cluster_boost(
     if not selected:
         return selected
 
+    now = datetime.now(timezone.utc).isoformat()
     entry_ids = [m["id"] for m in selected]
     placeholders = ",".join("?" * len(entry_ids))
     cursor = await db.execute(
@@ -973,6 +1003,11 @@ async def _cluster_boost(
             if mid not in existing_ids and mid not in cluster_extra:
                 m["_relevance"] = 0.9  # 集群成员高分 boost
                 cluster_extra[mid] = m
+                # 记录集群访问到 access_log
+                await db.execute(
+                    "INSERT INTO access_log (entry_id, accessed_at, context) VALUES (?, ?, 'cluster')",
+                    (mid, now),
+                )
 
     # 标记 linked_memories
     for extra_id in cluster_extra:
@@ -1088,6 +1123,17 @@ async def correct_entry(
     Returns:
         {old_entry_id, new_entry_id, old_corrected, version_chain}
     """
+    async with _lock_key(namespace, key):
+        return await _correct_entry_impl(namespace, key, new_value, reason)
+
+
+async def _correct_entry_impl(
+    namespace: str,
+    key: str,
+    new_value: str,
+    reason: str = "",
+) -> dict:
+    """correct_entry 的实际实现（调用方需先获取锁）。"""
     db = await _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1100,7 +1146,7 @@ async def correct_entry(
 
     if old is None:
         # 不存在 → 直接创建新条目
-        new_id = await set(namespace, key, new_value)
+        new_id = await _set_impl(namespace, key, new_value)
         return {
             "old_entry_id": None,
             "new_entry_id": new_id,
@@ -1132,8 +1178,8 @@ async def correct_entry(
     cursor = await db.execute(
         """INSERT INTO entries (namespace, key, value, version, expired,
            created_at, updated_at, memory_layer, decay_curve, salience,
-           correction_reason, source, group_id)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'none', ?, ?, ?, ?)""",
+           correction_reason, source, group_id, participants)
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'none', ?, ?, ?, ?, ?)""",
         (
             namespace, key, new_value, old_dict["version"] + 1,
             now, now,
@@ -1142,6 +1188,7 @@ async def correct_entry(
             reason,
             old_dict.get("source", "private"),
             old_dict.get("group_id"),
+            old_dict.get("participants"),  # 继承旧条目的参与者信息
         ),
     )
     new_id = cursor.lastrowid
@@ -1798,22 +1845,39 @@ async def apply_decay() -> dict:
 
 
 def _to_fuzzy_time(iso_str: str) -> str:
-    """将 ISO 时间戳转为模糊时间段描述。"""
+    """将 ISO 时间戳转为模糊时间段描述。
+
+    精度分级：
+      0天 → 今天 | 1天 → 昨天 | 2-6天 → X天前
+      7-27天 → X周前 | 28-59天 → 上个月
+      60-179天 → 几个月前 | 180-364天 → 半年前
+      365-729天 → 去年 | >2年 → X年前
+    """
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
         diff_days = (now - dt.replace(tzinfo=timezone.utc)).days
 
-        if diff_days < 7:
-            return "最近几天"
-        elif diff_days < 30:
-            return f"{diff_days // 7}周前"
+        if diff_days == 0:
+            return "今天"
+        elif diff_days == 1:
+            return "昨天"
+        elif diff_days < 7:
+            return f"{diff_days}天前"
+        elif diff_days < 28:
+            weeks = diff_days // 7
+            return f"大约{weeks}周前" if weeks <= 3 else "几周前"
         elif diff_days < 60:
             return "上个月"
         elif diff_days < 180:
-            return f"{dt.month}月初"
+            return "几个月前"
+        elif diff_days < 365:
+            return "半年前"
+        elif diff_days < 730:
+            return "去年"
         else:
-            return f"{dt.year}年{dt.month}月"
+            years = diff_days // 365
+            return f"{years}年前"
     except Exception:
         return "以前"
 
