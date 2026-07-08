@@ -3,6 +3,23 @@
 > 零 CLI 依赖，纯 HTTP 调用大模型 API  
 > 集 QQ 协议 + LLM 引擎 + 多脑协调 + 记忆系统于一体
 
+[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Phase](https://img.shields.io/badge/Phase%201-Implemented-success.svg)](specs/001-cognitive-architecture/)
+[![SQLite](https://img.shields.io/badge/SQLite-FTS5-orange.svg)](https://www.sqlite.org/fts5.html)
+
+## 目录
+
+- [架构](#架构)
+- [特性](#特性)
+- [技术栈](#技术栈)
+- [快速开始](#快速开始)
+- [配置参考](#配置参考)
+- [API](#api)
+- [记忆系统](#记忆系统)
+- [项目结构](#项目结构)
+- [与 qq-bot 的关系](#与-qq-bot-的关系)
+
 ## 架构
 
 ```
@@ -51,6 +68,18 @@ QQ 用户发消息
 - **QQ 社交采集** — 自动获取昵称/群名，24h/1h 缓存
 - **会话持久化** — JSON 文件自动保存，重启不丢失
 - **Web UI** — 实时消息监控 + 手动回复
+
+## 技术栈
+
+| 组件 | 技术 |
+|------|------|
+| 语言 | Python 3.12+ |
+| LLM SDK | openai >= 1.0 (AsyncOpenAI) |
+| 数据库 | SQLite + FTS5 (aiosqlite) |
+| HTTP | aiohttp |
+| QQ 协议 | WebSocket + REST API |
+| 中文分词 | jieba (可选增强，回退规则分词) |
+| 部署 | 单进程 localhost:18090 |
 
 ## 快速开始
 
@@ -182,6 +211,31 @@ main.py 启动后按偏移调度:
 
 **数据表**: `entries`（15 新列）| `memory_links` | `memory_clusters` | `cluster_members` | `access_log`
 
+## 项目结构
+
+```
+chat-engine/
+├── main.py              # 单进程统一入口 (HTTP + QQ + LLM)
+├── engine.py            # LLM 引擎 + 上下文组装 + 关键词提取
+├── brain.py             # 多脑评估 (理性脑 + 感性脑 + 融合决策)
+├── orchestrator.py      # QQ 消息路由 + 场景标记 + 追答调度
+├── memory_store.py      # SQLite/FTS5 记忆系统 (检索/纠错/衰减/集群)
+├── qq_protocol.py       # QQ WebSocket 长连接
+├── session.py           # 会话管理 + 持久化
+├── config.py            # 环境变量集中管理
+├── social.py            # QQ 社交信息采集 (昵称/群名)
+├── botuser.py           # 用户数据存储
+├── server.py            # HTTP/WS 服务器
+├── manage.sh            # 启停管理脚本
+├── index.html           # Web UI 前端
+├── specs/               # 规格文档 (spec/plan/tasks/contracts)
+└── docs/                # 设计文档
+```
+
 ## 与 qq-bot 的关系
 
 chat-engine 已内置 QQ 协议层，**不再依赖 qq-bot**。qq-bot 作为历史项目保留，可通过 `AI_BACKEND=chat-engine` 接入本引擎。
+
+## License
+
+MIT — 详见 [LICENSE](LICENSE)
