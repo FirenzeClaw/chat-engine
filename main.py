@@ -10,7 +10,6 @@ Chat Engine + QQ Bot 统一入口
 
 import asyncio
 import json
-import logging
 import uuid
 from pathlib import Path
 from typing import Set
@@ -22,13 +21,10 @@ from config import (
     HTTP_HOST, HTTP_PORT, HEARTBEAT_INTERVAL,
     QQ_BOT_APPID, QQ_BOT_SECRET, QQ_WS_URL,
 )
-from qq_protocol import run_qq_loop, get_access_token
+from qq_protocol import run_qq_loop, get_access_token, MessageContext, send_message
 
-logger = logging.getLogger("main")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[main] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("main")
 
 # WebSocket 客户端管理
 ws_clients: Set[web.WebSocketResponse] = set()
@@ -37,14 +33,18 @@ message_queue = asyncio.Queue()
 
 # ==================== QQ 消息回调 ====================
 
-async def on_qq_message(unified_msg: dict):
+async def on_qq_message(ctx: MessageContext):
     """QQ 消息到达 → 分发处理"""
-    user_id = unified_msg.get("user_id", "unknown")
+    user_id = ctx.user_id
 
-    # 持久化
+    # 持久化（botuser 仍用旧格式兼容）
     try:
         import botuser
-        botuser.save_message(user_id, unified_msg)
+        botuser.save_message(user_id, {
+            "user_id": ctx.user_id, "username": ctx.username,
+            "content": ctx.content, "group_id": ctx.group_id,
+            "msg_type": ctx.msg_type, "timestamp": ctx.timestamp,
+        })
     except Exception:
         pass
 
@@ -52,81 +52,39 @@ async def on_qq_message(unified_msg: dict):
     try:
         import social
         asyncio.create_task(social.fetch_user_profile(user_id))
-        gid = unified_msg.get("group_id", "")
-        if gid:
-            asyncio.create_task(social.fetch_group_info(gid))
+        if ctx.group_id:
+            asyncio.create_task(social.fetch_group_info(ctx.group_id))
     except Exception:
         pass
 
     # 广播给前端
+    broadcast = {
+        "user_id": ctx.user_id, "username": ctx.username,
+        "content": ctx.content, "group_id": ctx.group_id,
+        "msg_type": ctx.msg_type, "timestamp": ctx.timestamp,
+    }
     for client in list(ws_clients):
         try:
-            await client.send_json(unified_msg)
+            await client.send_json(broadcast)
         except Exception:
             ws_clients.discard(client)
 
-    # 协调器处理 → AI 回复（包装异常处理，防止 task 异常被静默丢弃）
-    async def _safe_process(user_id, content, msg_metadata, send_reply):
+    # 协调器处理 → AI 回复
+    async def _safe_process():
         try:
-            await process_qq_message(user_id, content, msg_metadata, send_reply)
+            # send_reply 回调：通过 qq_protocol 发送回复
+            async def _reply(content: str):
+                await send_message(ctx, content)
+
+            await process_qq_message(ctx, _reply)
         except Exception:
             logger.exception("消息处理任务异常: user=%s", user_id[:16])
 
     try:
         from orchestrator import process_qq_message
-        asyncio.create_task(_safe_process(
-            user_id=user_id,
-            content=unified_msg.get("content", ""),
-            msg_metadata=unified_msg,
-            send_reply=send_qq_message,
-        ))
+        asyncio.create_task(_safe_process())
     except Exception as e:
         logger.exception("消息处理任务创建失败")
-
-
-# ==================== QQ 消息发送 ====================
-
-async def send_qq_message(data: dict):
-    """通过 QQ REST API 发送消息"""
-    user_id = data.get("user_id", "")
-    content = data.get("content", "")
-    group_id = data.get("group_id", "")
-    channel_id = data.get("channel_id", "")
-    guild_id = data.get("guild_id", "")
-    msg_type = data.get("msg_type", "")
-    ref_msg_id = data.get("ref_msg_id", "")
-
-    if msg_type == "AT_MESSAGE_CREATE":
-        if not channel_id:
-            return
-        url = f"https://api.sgroup.qq.com/v2/channels/{channel_id}/messages"
-    elif msg_type == "DIRECT_MESSAGE_CREATE":
-        if not guild_id:
-            return
-        url = f"https://api.sgroup.qq.com/v2/dms/{guild_id}/messages"
-    elif "GROUP" in msg_type:
-        if not group_id:
-            return
-        url = f"https://api.sgroup.qq.com/v2/groups/{group_id}/messages"
-    else:
-        url = f"https://api.sgroup.qq.com/v2/users/{user_id}/messages"
-
-    msg_id = ref_msg_id if ref_msg_id else uuid.uuid4().hex
-    payload = {"content": content, "msg_type": 0, "msg_id": msg_id, "msg_seq": 1}
-
-    headers = {
-        "Authorization": f"QQBot {await get_access_token()}",
-        "Content-Type": "application/json",
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                if resp.status == 200:
-                    logger.info("回复已发送 → %s", user_id[:12])
-                else:
-                    logger.warning("发送失败 %d: %s", resp.status, await resp.text())
-        except Exception as e:
-            logger.exception("发送异常")
 
 
 # ==================== HTTP 处理器 ====================
@@ -157,12 +115,14 @@ async def manual_reply_consumer():
     while True:
         data = await message_queue.get()
         if data.get("user_id") and data.get("content"):
-            await send_qq_message({
-                "user_id": data["user_id"],
-                "content": data["content"],
-                "msg_type": "C2C_MESSAGE_CREATE",
-                "group_id": "", "channel_id": "", "guild_id": "", "ref_msg_id": "",
-            })
+            from qq_protocol import MessageContext, send_message
+            ctx = MessageContext(
+                user_id=data["user_id"],
+                username="",
+                content=data["content"],
+                msg_type="C2C_MESSAGE_CREATE",
+            )
+            await send_message(ctx, data["content"])
             logger.info("手动回复已发送 → %s", data["user_id"][:12])
 
 
@@ -172,6 +132,7 @@ async def manual_reply_consumer():
 from server import handle_chat, handle_chat_full, handle_evaluate, handle_ws_chat
 from server import handle_get_session, handle_get_evaluation, handle_delete_session, handle_status, handle_health
 from server import handle_session_health, handle_monitor
+from server import handle_context_health, handle_get_personality, handle_patch_personality
 
 
 # ==================== Main ====================
@@ -189,6 +150,27 @@ async def main():
     from reply_scheduler import get_scheduler
     scheduler = get_scheduler()
     await scheduler.start()
+
+    # Spec 003: 初始化新模块单例
+    from context_manager import get_context_manager
+    ctx_mgr = get_context_manager()
+    logger.info("ContextManager 已初始化")
+
+    from image_handler import retrieve_relevant_images
+    logger.info("ImageHandler 已就绪")
+
+    from web_search import get_web_manager
+    wm = get_web_manager()
+    logger.info("WebSearchManager 已初始化")
+
+    from boredom import get_boredom_detector
+    bd = get_boredom_detector()
+    logger.info("BoredomDetector 已初始化")
+
+    from personality import get_personality
+    p = get_personality()
+    logger.info("Personality 已加载: curiosity=%.1f sociability=%.1f",
+                 p.weights.curiosity, p.weights.sociability)
 
     # 创建 HTTP 应用
     app = web.Application()
@@ -209,6 +191,9 @@ async def main():
     app.router.add_get("/v1/status", handle_status)
     app.router.add_get("/v1/monitor", handle_monitor)
     app.router.add_get("/v1/health", handle_health)
+    app.router.add_get("/v1/context/health", handle_context_health)
+    app.router.add_get("/v1/personality", handle_get_personality)
+    app.router.add_patch("/v1/personality", handle_patch_personality)
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():

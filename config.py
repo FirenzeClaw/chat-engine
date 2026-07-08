@@ -14,10 +14,10 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 
-# 辅脑：快速、便宜，用于即时回复
-LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", os.getenv("LLM_MODEL", "deepseek-chat"))
-# 主脑：强推理，用于评估/追答生成
-LLM_STRONG_MODEL = os.getenv("LLM_STRONG_MODEL", os.getenv("LLM_MODEL", "deepseek-chat"))
+# 辅脑：快速、便宜（纯文本），用于即时回复
+LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", os.getenv("LLM_MODEL", "step-3.5-flash"))
+# 主脑：强推理 + 多模态，用于图片理解、评估、追答
+LLM_STRONG_MODEL = os.getenv("LLM_STRONG_MODEL", os.getenv("LLM_MODEL", "step-3.7-flash"))
 LLM_MODEL = LLM_FAST_MODEL
 # 推理强度（step-3.7-flash 等推理模型支持: low/medium/high）
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "")
@@ -38,7 +38,7 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 # --- Session ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))  # 会话过期时间（秒）
 MAX_CONTEXT_ROUNDS = int(os.getenv("MAX_CONTEXT_ROUNDS", "20"))  # 最大上下文轮数（回退用）
-MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "4096"))  # 上下文窗口 token 上限
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "260000"))  # 上下文窗口 token 上限 (step-3.7-flash)
 CONTEXT_SATURATION_PCT = float(os.getenv("CONTEXT_SATURATION_PCT", "0.80"))  # 饱和度告警阈值
 MEMORY_INJECT_MODE = os.getenv("MEMORY_INJECT_MODE", "auto")  # auto | full | light | off
 ACCESS_BOOST_DAYS = int(os.getenv("ACCESS_BOOST_DAYS", "7"))  # 高频访问 boost 判定窗口
@@ -92,3 +92,35 @@ DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", (
     "回复自然口语化，2-4句话为宜，适度使用 emoji。"
     "诚实不刻薄、关心不越界、有趣不低俗。"
 ))
+
+# --- Spec 003: 多模态自主 AI ---
+# 上下文管理
+CONTEXT_COMPRESS_PCT = float(os.getenv("CONTEXT_COMPRESS_PCT", "0.80"))
+CONTEXT_RETIRE_PCT = float(os.getenv("CONTEXT_RETIRE_PCT", "0.95"))
+CONTEXT_KEEP_RECENT = int(os.getenv("CONTEXT_KEEP_RECENT", "5"))
+
+# 图片
+IMAGE_MAX_SIZE_MB = int(os.getenv("IMAGE_MAX_SIZE_MB", "20"))
+IMAGE_STORAGE_DIR = os.getenv("IMAGE_STORAGE_DIR", "botuser/images")
+
+# 网页搜索
+WEB_SEARCH_MAX_PER_HOUR = int(os.getenv("WEB_SEARCH_MAX_PER_HOUR", "5"))
+WEB_SEARCH_AUTO_MAX_PER_DAY = int(os.getenv("WEB_SEARCH_AUTO_MAX_PER_DAY", "10"))
+WEB_FETCH_TIMEOUT = int(os.getenv("WEB_FETCH_TIMEOUT", "15"))
+
+# 无聊系统
+BOREDOM_GROUP_COLD_MIN = int(os.getenv("BOREDOM_GROUP_COLD_MIN", "30"))
+BOREDOM_FRIEND_SILENT_H = int(os.getenv("BOREDOM_FRIEND_SILENT_H", "2"))
+BOREDOM_GROUP_MAX_PER_DAY = int(os.getenv("BOREDOM_GROUP_MAX_PER_DAY", "3"))
+BOREDOM_PRIVATE_MAX_PER_DAY = int(os.getenv("BOREDOM_PRIVATE_MAX_PER_DAY", "1"))
+BOREDOM_NIGHT_START = int(os.getenv("BOREDOM_NIGHT_START", "0"))
+BOREDOM_NIGHT_END = int(os.getenv("BOREDOM_NIGHT_END", "7"))
+BOREDOM_COOLDOWN_MIN = int(os.getenv("BOREDOM_COOLDOWN_MIN", "5"))
+
+# 日志级别
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# 个性权重
+PERSONALITY_WEIGHTS = os.getenv("PERSONALITY_WEIGHTS",
+    '{"curiosity":0.7,"sociability":0.8,"playfulness":0.6,"empathy":0.5,'
+    '"assertiveness":0.3,"creativity":0.6,"impulsiveness":0.2,"loyalty":0.75}')

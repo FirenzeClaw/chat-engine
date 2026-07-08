@@ -12,48 +12,40 @@ QQ Bot 消息协调器 — chat-engine 独立版
 
 import asyncio
 import json
-import logging
 from datetime import datetime, timezone
 
-logger = logging.getLogger("orch")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[orch] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+from qq_protocol import MessageContext, ReplyCallback
+
+logger = get_logger("orch")
 
 
 async def process_qq_message(
-    user_id: str,
-    content: str,
-    msg_metadata: dict,
-    send_reply,
+    ctx: MessageContext,
+    send_reply: ReplyCallback,
 ) -> str:
     """处理 QQ 消息：委托 reply_scheduler 管理回复节奏。
 
     Args:
-        user_id: QQ openid
-        content: 用户原始消息文本
-        msg_metadata: QQ 消息元数据 (group_id, channel_id 等)
-        send_reply: async callable(reply_dict) — 发送 QQ 消息的回调
+        ctx: 类型化消息上下文
+        send_reply: async callable(content: str) — 发送回复的回调
 
     Returns:
         空字符串（回复由 scheduler 异步处理）。
     """
-    msg_type = msg_metadata.get("msg_type", "")
-    is_group = "GROUP" in msg_type
-    is_at = "AT_MESSAGE" in msg_type
-    is_direct = "DIRECT" in msg_type or "C2C" in msg_type
+    # 图片消息检测：提取 URL，异步存储，同时直接传给 LLM
+    if ctx.image_urls:
+        logger.info("检测到图片消息 (%d 张): user=%s", len(ctx.image_urls), ctx.user_id[:12])
+        for img_url in ctx.image_urls:
+            asyncio.create_task(_handle_image_message(img_url, ctx))
 
     # 群聊普通消息：仅旁听记录，不回复（避免噪音/延迟/成本）
-    if is_group and not is_at and not is_direct:
-        logger.debug("群聊普通消息，跳过回复: type=%s", msg_type)
-        asyncio.create_task(_passive_observe(user_id, content, msg_metadata))
-        # 记录发言人供频率分析用
+    if ctx.is_group and not ctx.is_at and not ctx.is_direct:
+        logger.debug("群聊普通消息，跳过回复: type=%s", ctx.msg_type)
+        asyncio.create_task(_passive_observe(ctx))
         try:
             from reply_scheduler import get_scheduler
-            await get_scheduler().record_group_speaker(
-                msg_metadata.get("group_id", ""), user_id
-            )
+            await get_scheduler().record_group_speaker(ctx.group_id, ctx.user_id)
         except Exception:
             pass
         return ""
@@ -61,11 +53,27 @@ async def process_qq_message(
     # 私聊 / @ / C2C → 委托 reply_scheduler
     from reply_scheduler import get_scheduler
     scheduler = get_scheduler()
-    await scheduler.enqueue(user_id, content, msg_metadata, send_reply)
+    await scheduler.enqueue(ctx, send_reply)
     return ""
 
 
-async def _passive_observe(user_id: str, content: str, msg_metadata: dict) -> None:
+async def _handle_image_message(image_url: str, ctx: MessageContext) -> None:
+    """处理图片消息：下载 → 理解 → 分类 → 存储（fire-and-forget）。"""
+    try:
+        from image_handler import handle_image
+        result = await handle_image(image_url, ctx.user_id, ctx.msg_id, {"group_id": ctx.group_id})
+        if "error" in result:
+            logger.warning("图片处理失败: %s", result["error"])
+        else:
+            logger.info(
+                "图片处理完成: category=%s tags=%s",
+                result.get("category"), result.get("tags"),
+            )
+    except Exception:
+        logger.exception("图片处理异常")
+
+
+async def _passive_observe(ctx: MessageContext) -> None:
     """被动观察模式：群聊普通消息不做回复，仅记录到记忆系统。
 
     让 Bot 作为一个"旁听者"积累对群成员和话题的了解，
@@ -73,23 +81,22 @@ async def _passive_observe(user_id: str, content: str, msg_metadata: dict) -> No
     """
     try:
         from memory_store import set as mem_set
-        gid = msg_metadata.get("group_id", "")
         summary = json.dumps({
             "date": datetime.now(timezone.utc).isoformat(),
-            "summary": f"[群聊观察] {content[:100]}",
+            "summary": f"[群聊观察] {ctx.content[:100]}",
             "topics": [],
             "source": "group",
-            "group_id": gid,
+            "group_id": ctx.group_id,
         }, ensure_ascii=False)
         await mem_set(
-            f"user/{user_id}/conversations",
+            f"user/{ctx.user_id}/conversations",
             datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
             summary,
             source="group",
-            group_id=gid,
-            participants=json.dumps([user_id]),
+            group_id=ctx.group_id,
+            participants=json.dumps([ctx.user_id]),
         )
-        logger.debug("被动观察已记录: %s, %s", user_id[:12], content[:30])
+        logger.debug("被动观察已记录: %s, %s", ctx.user_id[:12], ctx.content[:30])
     except Exception:
         pass
 

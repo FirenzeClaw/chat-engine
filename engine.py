@@ -17,7 +17,6 @@ orchestrator 只负责路由，不参与 prompt 拼装。
 
 import asyncio
 import json
-import logging
 import time
 from typing import Optional
 
@@ -26,14 +25,12 @@ from openai import AsyncOpenAI
 from config import (
     LLM_API_KEY, LLM_BASE_URL, LLM_FAST_MODEL, LLM_STRONG_MODEL,
     DEFAULT_SYSTEM_PROMPT, MAX_CONTEXT_TOKENS, LLM_REASONING_EFFORT,
+    CONTEXT_COMPRESS_PCT, CONTEXT_RETIRE_PCT, CONTEXT_KEEP_RECENT,
 )
 from session import Session, SessionManager
 
-logger = logging.getLogger("engine")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[engine] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("engine")
 
 session_manager = SessionManager()
 
@@ -44,199 +41,7 @@ _strong_client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 # ==================== Context Assembly ====================
 
-# --- Phase 1: 关键词提取 ---
-
-# 中文停用词（高频无意义词）
-_STOPWORDS: set = {
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
-    "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
-    "没有", "看", "好", "自己", "这", "他", "她", "它", "们", "那", "些",
-    "什么", "怎么", "怎样", "哪", "吗", "呢", "吧", "啊", "哦", "嗯",
-    "可以", "能", "应该", "因为", "所以", "但是", "虽然", "如果", "的话",
-    "这个", "那个", "哪个", "一下", "一点", "觉得", "知道", "想", "让",
-    "给", "对", "跟", "用", "把", "被", "从", "向", "关于", "通过",
-}
-
-# 中文标点
-_CN_PUNCT = set("，。！？；：""''（）【】《》…—～、·")
-
-
-# --- jieba 可选增强（CONDITIONAL：存在则用，不存在则回退规则分词）---
-try:
-    import jieba
-
-    jieba.setLogLevel(20)  # 抑制 jieba 的 DEBUG 输出
-    _JIEBA_AVAILABLE = True
-except ImportError:
-    _JIEBA_AVAILABLE = False
-
-
-def _tokenize_jieba(text: str) -> list[str]:
-    """使用 jieba 分词，过滤停用词和标点。"""
-    import re
-    words = jieba.cut(text)
-    result: list[str] = []
-    for w in words:
-        w = w.strip()
-        if not w or len(w) < 2:
-            continue
-        if w in _STOPWORDS or w in _CN_PUNCT:
-            continue
-        if re.match(r'^[\s，。！？；：""''（）【】《》…—～、·]+$', w):
-            continue
-        result.append(w)
-    return result
-
-
-def _segment_text(text: str) -> list[str]:
-    """简单中文分词：优先 jieba，不存在时回退规则分词。"""
-    if _JIEBA_AVAILABLE:
-        try:
-            return _tokenize_jieba(text)
-        except Exception:
-            pass  # jieba 异常时降级
-
-    # 回退：规则分词
-    import re
-    blocks = re.findall(r'[\u4e00-\u9fff\uff00-\uffefA-Za-z0-9]+', text)
-    tokens: list[str] = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        if re.match(r'^[A-Za-z0-9]+$', block):
-            tokens.append(block.lower())
-            continue
-        chars = list(block)
-        n = len(chars)
-        for i in range(n):
-            ch = chars[i]
-            if ch not in _STOPWORDS and ch not in _CN_PUNCT and len(ch.strip()) > 0:
-                tokens.append(ch)
-            if i + 1 < n:
-                bi = chars[i] + chars[i + 1]
-                if bi not in _STOPWORDS:
-                    tokens.append(bi)
-            if i + 2 < n:
-                tri = chars[i] + chars[i + 1] + chars[i + 2]
-                tokens.append(tri)
-    seen: set[str] = set()
-    result: list[str] = []
-    for t in tokens:
-        if t not in seen and len(t) >= 1:
-            seen.add(t)
-            result.append(t)
-    return result
-
-
-def _extract_keywords(content: str) -> list[str]:
-    """规则提取中文关键词。
-
-    流程：
-    1. 分词 → unigram/bigram/trigram
-    2. 过滤停用词和标点
-    3. 按词频排序
-    4. 优先返回 bigram/trigram，其次 unigram
-    5. 最多返回 10 个关键词
-    """
-    tokens = _segment_text(content)
-
-    # 按长度分组
-    multis = [t for t in tokens if len(t) >= 2]  # bigram/trigram
-    singles = [t for t in tokens if len(t) == 1]  # unigram
-
-    # 去重保持顺序
-    seen: set[str] = set()
-    result: list[str] = []
-    for t in multis:
-        if t not in seen:
-            seen.add(t)
-            result.append(t)
-    for t in singles:
-        if t not in seen:
-            seen.add(t)
-            result.append(t)
-
-    return result[:10]
-
-
-async def _llm_extract_keywords(content: str) -> list[str]:
-    """LLM 提取关键词 + 话题标签 + 指代消解。
-
-    使用 LLM_FAST_MODEL，超时 200ms 降级为规则结果。
-    """
-    prompt = f"""从以下用户消息中提取关键词(2-5个)、话题标签(1-3个)、指代消解。
-
-消息: {content}
-
-输出 JSON 格式:
-{{"keywords": ["词1","词2"], "topic_tags": ["标签1"], "resolved_entities": {{"他":"张三"}}}}"""
-
-    try:
-        response = await asyncio.wait_for(
-            _fast_client.chat.completions.create(
-                model=LLM_FAST_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=128,
-                temperature=0.1,
-            ),
-            timeout=1.0,
-        )
-        raw = response.choices[0].message.content or ""
-        # 解析 JSON
-        try:
-            if "```json" in raw:
-                raw = raw[raw.index("```json") + 7:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            elif "```" in raw:
-                raw = raw[raw.index("```") + 3:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            data = json.loads(raw.strip())
-            return data.get("keywords", [])
-        except (json.JSONDecodeError, ValueError):
-            return []
-    except asyncio.TimeoutError:
-        logger.debug("LLM 关键词提取超时，降级为规则结果")
-        return []
-    except Exception:
-        return []
-
-
-def _get_search_keywords(content: str) -> list[str]:
-    """获取搜索关键词（同步入口）。
-
-    规则: 规则提取 → 结果<3且消息>10字 → LLM 补全
-    返回关键词列表。
-    """
-    keywords = _extract_keywords(content)
-
-    if len(keywords) < 3 and len(content) > 10:
-        # 需要 LLM 补全，但同步返回规则结果
-        # LLM 补全在异步上下文调用
-        return keywords  # 调用方在 retrieve_relevant 中处理 LLM 补全
-
-    return keywords
-
-
-async def _get_search_keywords_async(content: str) -> list[str]:
-    """获取搜索关键词（异步入口，含 LLM 补全）。"""
-    keywords = _extract_keywords(content)
-
-    if len(keywords) < 3 and len(content) > 10:
-        llm_kw = await _llm_extract_keywords(content)
-        if llm_kw:
-            # 合并去重，LLM 结果优先
-            seen = set(keywords)
-            merged = list(keywords)
-            for kw in llm_kw:
-                if kw not in seen:
-                    seen.add(kw)
-                    merged.append(kw)
-            return merged[:10]
-
-    return keywords
+# 关键词提取已迁至 context_manager.extract_keywords_async
 
 
 async def _assemble_system_prompt(
@@ -277,7 +82,7 @@ async def _assemble_system_prompt(
 
         if user_message and MEMORY_INJECT_MODE != "full":
             # 语义检索模式：提取关键词 → 检索 → 注入 top-5
-            keywords = await _get_search_keywords_async(user_message)
+            keywords = await context_manager.extract_keywords_async(user_message)
             search_query = " ".join(keywords) if keywords else user_message
             memories = await retrieve_relevant(search_query, user_id)
             if memories:
@@ -295,6 +100,23 @@ async def _assemble_system_prompt(
                     "记忆注入: user=%s, memories=%d",
                     user_id[:12], len(memories),
                 )
+
+            # Spec 003: 注入相关图片记忆
+            try:
+                from image_handler import retrieve_relevant_images
+                if keywords:
+                    image_query = " ".join(keywords[:3])
+                    images = await retrieve_relevant_images(image_query, user_id)
+                    if images:
+                        img_lines = ["相关图片记忆:"]
+                        for img in images[:3]:
+                            desc = img.get("description", "")[:60]
+                            opinion = img.get("opinion", "")[:40]
+                            img_lines.append(f"- [{img.get('category', '')}] {desc}" + (f" ({opinion})" if opinion else ""))
+                        parts.append("\n".join(img_lines))
+            except Exception:
+                pass
+
         else:
             # 全量模式（旧行为，兼容）
             from memory_store import build_index
@@ -307,60 +129,60 @@ async def _assemble_system_prompt(
     return "\n\n".join(parts)
 
 
-def _estimate_tokens(text: str) -> int:
-    """粗略 token 估算。中文 1 字≈1 token，英文 1 词≈1.3 token。"""
-    import re
-    # 中文/日文/韩文字符
-    cjk = len(re.findall(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text))
-    # 去掉 CJK 后按空格分词（英文）
-    rest = re.sub(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', ' ', text)
-    words = len(rest.split())
-    return cjk + int(words * 1.3)
-
-
-def _trim_context(messages: list[dict], max_tokens: int) -> list[dict]:
-    """Token 感知的上下文修剪：保留 system 消息完整，从新到旧截断 chat 消息。"""
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    chat_msgs = [m for m in messages if m["role"] in ("user", "assistant")]
-
-    total = sum(_estimate_tokens(m["content"]) for m in system_msgs)
-    kept = []
-    for msg in reversed(chat_msgs):  # 从最新往前保留
-        t = _estimate_tokens(msg["content"])
-        if total + t > max_tokens:
-            break
-        kept.insert(0, msg)
-        total += t
-
-    trimmed = system_msgs + kept
-    if len(chat_msgs) > len(kept):
-        logger.warning(
-            "上下文修剪: %d → %d 条消息, tokens ≈%d/%d",
-            len(chat_msgs), len(kept), total, max_tokens,
-        )
-    return trimmed
-
-
 async def _build_messages(
     session: Session,
     user_message: str,
     user_id: str,
+    image_urls: list[str] = None,
 ) -> list[dict]:
     """构建发给 LLM 的完整 messages 数组。
 
-    格式：[system: persona+记忆] + [纯净历史] + [user: 原始消息]
+    格式：[system: persona+记忆] + [压缩/退役后历史] + [user: 文本/多模态]
+    有图片时 user content 为 [{text}, {image_url}, ...] 多模态数组。
+    通过 ContextManager 的三级保护防止静默截断。
     """
+    import context_manager
+
     is_new = len(session.messages) == 0
     system_prompt = await _assemble_system_prompt(user_id, is_new, user_message)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages += session.get_context()
-    messages.append({"role": "user", "content": user_message})
 
-    # Token 感知修剪（保留 system 完整，截断历史 chat 部分）
-    if MAX_CONTEXT_TOKENS > 0:
-        messages = _trim_context(messages, MAX_CONTEXT_TOKENS)
+    # 构建最后一条 user message（有图片时用多模态格式）
+    def _build_user_msg():
+        if image_urls:
+            uc = [{"type": "text", "text": user_message or "看一下这张图片"}]
+            for url in image_urls:
+                uc.append({"type": "image_url", "image_url": {"url": url}})
+            return {"role": "user", "content": uc}
+        return {"role": "user", "content": user_message}
 
+    messages.append(_build_user_msg())
+
+    # ContextManager 三级保护：估算 → 检查 → 压缩/退役
+    ctx_mgr = context_manager.get_context_manager()
+    total = context_manager.estimate_total_tokens(messages, [], [])
+    ctx_status = context_manager.check_and_handle(
+        messages, total,
+        compress_pct=CONTEXT_COMPRESS_PCT,
+        retire_pct=CONTEXT_RETIRE_PCT,
+    )
+
+    if ctx_status == "compressed":
+        chat_msgs = [m for m in session.get_context() if m.get("role") in ("user", "assistant")]
+        if len(chat_msgs) > CONTEXT_KEEP_RECENT * 2:
+            compressed = await context_manager.compress_old_messages(
+                chat_msgs, keep_recent=CONTEXT_KEEP_RECENT
+            )
+            messages = [{"role": "system", "content": system_prompt}] + compressed + [_build_user_msg()]
+            logger.info("上下文已压缩: session=%s", session.session_id[:12])
+    elif ctx_status == "retired":
+        messages = context_manager.retire_to_minimal(messages, CONTEXT_KEEP_RECENT)
+        messages = [{"role": "system", "content": system_prompt}] + messages[len([m for m in messages if m.get("role") == "system"]):] + [_build_user_msg()]
+        logger.warning("上下文已退役: session=%s", session.session_id[:12])
+
+    # context_manager 的压缩/退役已是最终保护，不再需要 _trim_context 二次修剪
     return messages
 
 
@@ -411,6 +233,7 @@ async def chat(
     max_tokens: int = 512,
     role: str = "fast",
     metadata: Optional[dict] = None,
+    image_urls: list[str] = None,
 ) -> dict:
     """发送消息并获取回复（辅脑/主脑可选）。
 
@@ -437,13 +260,19 @@ async def chat(
 
     # 构建上下文（实时拉取 persona + 记忆索引）
     try:
-        messages = await _build_messages(session, user_message, session_id)
+        messages = await _build_messages(session, user_message, session_id, image_urls)
     except Exception:
         # memory_store 不可用时降级为纯历史模式
         logger.exception("上下文组装失败，降级为纯历史模式")
         messages = [{"role": "system", "content": session.system_prompt}]
         messages += session.get_context()
-        messages.append({"role": "user", "content": user_message})
+        if image_urls:
+            user_content = [{"type": "text", "text": user_message}]
+            for url in image_urls:
+                user_content.append({"type": "image_url", "image_url": {"url": url}})
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": user_message})
 
     # 存入 session 的是原始消息（纯净文本，不含记忆索引）
     session.add_message("user", user_message)
@@ -467,8 +296,14 @@ async def chat(
             api_client.chat.completions.create(**api_kwargs),
             timeout=30,
         )
-        reply = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        reply = choice.message.content or ""
+        # step-3.7-flash 推理模型可能用 reasoning_content
+        if not reply and hasattr(choice.message, 'reasoning_content'):
+            reply = choice.message.reasoning_content or ""
         reply = reply.strip()
+        logger.info("LLM raw: finish=%s, content_len=%d, model=%s",
+                     choice.finish_reason, len(reply), model)
     except asyncio.TimeoutError:
         reply = "[超时] LLM 未在 30s 内回复"
     except Exception as e:

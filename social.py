@@ -5,18 +5,14 @@ QQ 社交信息采集模块
 """
 
 import json
-import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
 
-logger = logging.getLogger("social")
-_social_handler = logging.StreamHandler()
-_social_handler.setFormatter(logging.Formatter("[social] %(message)s"))
-logger.addHandler(_social_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("social")
 
 # 缓存过期时间（秒）
 CACHE_USER_PROFILE = 24 * 3600   # 24 小时

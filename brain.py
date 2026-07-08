@@ -10,7 +10,6 @@
 """
 
 import json
-import logging
 import re
 import time
 from typing import Optional
@@ -22,11 +21,8 @@ from config import (
     FOLLOW_UP_ENABLED, FOLLOW_UP_MAX_PER_HOUR,
 )
 
-logger = logging.getLogger("brain")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[brain] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("brain")
 
 # 追答频率控制
 _follow_up_counter: dict[str, list[float]] = {}
@@ -89,15 +85,18 @@ def _build_eval_prompt(brain_type: str, user_msg: str, reply: str) -> str:
 标准：情感基调是否合适？是否需要更多共情？{persona_hint}"""
 
 
+from json_utils import parse_json_block
+
+
 def _parse_eval(raw: str) -> dict:
     """解析 LLM 输出的 JSON。"""
     try:
-        if "```json" in raw:
-            raw = raw[raw.index("```json") + 7 : raw.index("```", raw.index("```json") + 7)]
-        elif "```" in raw:
-            raw = raw[raw.index("```") + 3 : raw.index("```", raw.index("```") + 3)]
-        return json.loads(raw.strip())
-    except (json.JSONDecodeError, ValueError, KeyError):
+        data = parse_json_block(raw)
+        if not data:
+            raise ValueError("empty parse result")
+        return data
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        logger.warning("eval JSON 解析失败: %s, raw=%s", e, raw[:200])
         return {"score": 0, "should_follow_up": False, "reason": "", "memory_update": None}
 
 
@@ -158,6 +157,7 @@ async def evaluate(
     user_message: str,
     fast_reply: str,
     system_prompt: str = "",
+    client: AsyncOpenAI | None = None,
 ) -> dict:
     """多脑评估 + 追答生成。
 
@@ -166,6 +166,7 @@ async def evaluate(
         user_message: 用户原始消息
         fast_reply: 辅脑的快速回复
         system_prompt: 评估用 system prompt
+        client: 可选，复用已有 AsyncOpenAI 客户端（不传则复用 engine 单例）
 
     Returns:
         {
@@ -187,7 +188,13 @@ async def evaluate(
         logger.debug("规则过滤: 不需追答 — %s", fast_reply[:40])
         return {"should_follow_up": False, "reason": "rule-filter", "combined_score": 0}
 
-    client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    if client is None:
+        # 复用 engine 模块级单例客户端（连接池复用），不传则惰性创建
+        try:
+            from engine import _strong_client
+            client = _strong_client
+        except ImportError:
+            client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
     async def call_eval(brain_type: str) -> dict:
         prompt = _build_eval_prompt(brain_type, user_message, fast_reply)
@@ -195,13 +202,19 @@ async def evaluate(
             resp = await client.chat.completions.create(
                 model=LLM_STRONG_MODEL,
                 messages=[
-                    {"role": "system", "content": system_prompt or "你是严谨的评估者。"},
+                    {"role": "system", "content": "仅输出 JSON，不要任何解释、思考过程或额外文字。"},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=256,
-                temperature=0.3,
+                max_tokens=512,
+                temperature=0.1,
+                reasoning_effort="low",
             )
-            return _parse_eval(resp.choices[0].message.content or "")
+            content = resp.choices[0].message.content or ""
+            # 推理模型可能有 reasoning_content
+            if not content and hasattr(resp.choices[0].message, 'reasoning_content'):
+                content = resp.choices[0].message.reasoning_content or ""
+            logger.info("%s eval raw: %s", brain_type, content[:200])
+            return _parse_eval(content)
         except Exception as e:
             logger.exception("%s 评估失败", brain_type)
             return {"score": 0, "should_follow_up": False, "reason": str(e), "memory_update": None}
@@ -255,7 +268,7 @@ async def _generate_follow_up(
         resp = await client.chat.completions.create(
             model=LLM_STRONG_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=512,
             temperature=0.7,
         )
         return (resp.choices[0].message.content or "").strip()

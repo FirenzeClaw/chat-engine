@@ -9,8 +9,8 @@ QQ Bot WebSocket 协议模块
 
 import asyncio
 import json
-import logging
 import time
+from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Set
 
 import aiohttp
@@ -19,11 +19,8 @@ from config import (
     QQ_BOT_APPID, QQ_BOT_SECRET, QQ_WS_URL, HEARTBEAT_INTERVAL,
 )
 
-logger = logging.getLogger("qq")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[QQ] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("qq")
 
 # Intents 位图
 # PUBLIC_GUILD_MESSAGES (1<<30): 频道 @ (AT_MESSAGE_CREATE)
@@ -73,22 +70,122 @@ def _is_duplicate(msg_id: str) -> bool:
     return False
 
 
-def _build_unified_msg(event_type: str, event_data: dict) -> dict:
-    """从 QQ 事件数据构造统一消息格式"""
+# ==================== Typed Message Seam ====================
+
+ReplyCallback = Callable[[str], Awaitable[None]]
+
+
+@dataclass
+class MessageContext:
+    """类型化消息上下文 — QQ 协议层与业务层之间的缝线。
+
+    替代原来的 untyped dict，所有 QQ 特定字段在此集中定义。
+    """
+    user_id: str
+    username: str
+    content: str
+    msg_type: str  # AT_MESSAGE_CREATE, C2C_MESSAGE_CREATE, GROUP_AT_MESSAGE_CREATE, etc.
+    msg_id: str = ""
+    group_id: str = ""
+    channel_id: str = ""
+    guild_id: str = ""
+    ref_msg_id: str = ""
+    timestamp: float = 0.0
+    image_urls: list[str] = field(default_factory=list)
+
+    @property
+    def is_group(self) -> bool:
+        return "GROUP" in self.msg_type
+
+    @property
+    def is_at(self) -> bool:
+        return "AT_MESSAGE" in self.msg_type
+
+    @property
+    def is_direct(self) -> bool:
+        return "DIRECT" in self.msg_type or "C2C" in self.msg_type
+
+    @property
+    def session_key(self) -> str:
+        """Actor session_key：私聊为 user_{uid}，群聊为 group_{gid}。"""
+        if self.is_group:
+            return f"group_{self.group_id or self.user_id}"
+        return f"user_{self.user_id}"
+
+    @property
+    def raw_uid(self) -> str:
+        """去掉 session_key 前缀的原始 ID。"""
+        return self.group_id or self.user_id if self.is_group else self.user_id
+
+
+def _build_unified_msg(event_type: str, event_data: dict) -> MessageContext:
+    """从 QQ 事件数据构造类型化消息上下文。"""
     author = event_data.get("author", {})
     msg_id = event_data.get("id", "")
-    return {
-        "type": event_type,
-        "id": msg_id,
-        "user_id": author.get("id", "unknown"),
-        "username": author.get("username", ""),
-        "content": event_data.get("content", ""),
-        "group_id": event_data.get("group_openid", ""),
-        "channel_id": event_data.get("channel_id", ""),
-        "guild_id": event_data.get("guild_id", ""),
-        "ref_msg_id": msg_id,
-        "timestamp": time.time(),
+    attachments = event_data.get("attachments", [])
+    image_urls = [
+        att.get("url", "")
+        for att in attachments
+        if att.get("content_type", "").startswith("image/")
+    ]
+    return MessageContext(
+        user_id=author.get("id", "unknown"),
+        username=author.get("username", ""),
+        content=event_data.get("content", ""),
+        msg_type=event_type,
+        msg_id=msg_id,
+        group_id=event_data.get("group_openid", ""),
+        channel_id=event_data.get("channel_id", ""),
+        guild_id=event_data.get("guild_id", ""),
+        ref_msg_id=msg_id,
+        timestamp=time.time(),
+        image_urls=image_urls,
+    )
+
+
+async def send_message(ctx: MessageContext, content: str) -> None:
+    """通过 QQ REST API 发送回复消息。从 main.py 迁入。"""
+    import uuid
+    import aiohttp as _aiohttp
+
+    if ctx.msg_type == "AT_MESSAGE_CREATE":
+        if not ctx.channel_id:
+            return
+        url = f"https://api.sgroup.qq.com/v2/channels/{ctx.channel_id}/messages"
+    elif ctx.msg_type == "DIRECT_MESSAGE_CREATE":
+        if not ctx.guild_id:
+            return
+        url = f"https://api.sgroup.qq.com/v2/dms/{ctx.guild_id}/messages"
+    elif ctx.is_group:
+        if not ctx.group_id:
+            return
+        url = f"https://api.sgroup.qq.com/v2/groups/{ctx.group_id}/messages"
+    else:
+        url = f"https://api.sgroup.qq.com/v2/users/{ctx.user_id}/messages"
+
+    msg_id = ctx.ref_msg_id if ctx.ref_msg_id else uuid.uuid4().hex
+    if not hasattr(send_message, '_seq_counter'):
+        send_message._seq_counter = {}
+    seq = send_message._seq_counter.get(ctx.user_id, 0) + 1
+    send_message._seq_counter[ctx.user_id] = seq
+    payload = {"content": content, "msg_type": 0, "msg_id": msg_id, "msg_seq": seq}
+
+    logger.info("发送 QQ 消息: type=%s, content=%s, url=%s",
+                 ctx.msg_type, content[:60], url.split("/v2/")[-1])
+
+    headers = {
+        "Authorization": f"QQBot {await _get_access_token()}",
+        "Content-Type": "application/json",
     }
+    async with _aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    logger.info("回复已发送 → %s", ctx.user_id[:12])
+                else:
+                    logger.warning("发送失败 %d: %s", resp.status, await resp.text())
+        except Exception:
+            logger.exception("发送异常")
 
 
 async def _heartbeat(ws, interval: float):
@@ -203,7 +300,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                                     continue
 
                                 unified_msg = _build_unified_msg(event_type, event_data)
-                                logger.info("收到消息: %s -> %s", unified_msg['user_id'], unified_msg['content'][:50])
+                                logger.info("收到消息: %s -> %s", unified_msg.user_id, unified_msg.content[:50])
                                 await on_message(unified_msg)
 
                 if hb_task:
@@ -218,5 +315,5 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
             await asyncio.sleep(5)
 
 
-# 导出 token 获取（供 send_qq_message 使用）
+# 导出 token 获取
 get_access_token = _get_access_token

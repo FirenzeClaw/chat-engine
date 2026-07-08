@@ -17,7 +17,6 @@
 
 import asyncio
 import json
-import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,13 +24,12 @@ from typing import Optional
 
 import aiosqlite
 
+from json_utils import parse_json_block
+
 from config import DB_PATH
 
-logger = logging.getLogger("memory_store")
-_memory_handler = logging.StreamHandler()
-_memory_handler.setFormatter(logging.Formatter("[memory] %(message)s"))
-logger.addHandler(_memory_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("memory_store")
 
 _db: Optional[aiosqlite.Connection] = None
 _db_path: str = ""
@@ -874,15 +872,7 @@ async def _llm_rank_memories(
         raw = response.choices[0].message.content or ""
         # 解析 JSON
         try:
-            if "```json" in raw:
-                raw = raw[raw.index("```json") + 7:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            elif "```" in raw:
-                raw = raw[raw.index("```") + 3:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            data = json.loads(raw.strip())
+            data = parse_json_block(raw)
             indices = data.get("selected", [])
             # 验证索引
             selected = []
@@ -1414,15 +1404,7 @@ async def _daily_link_scan() -> dict:
         )
         raw = response.choices[0].message.content or ""
         try:
-            if "```json" in raw:
-                raw = raw[raw.index("```json") + 7:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            elif "```" in raw:
-                raw = raw[raw.index("```") + 3:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            data = json.loads(raw.strip())
+            data = parse_json_block(raw)
             links = data.get("links", [])
 
             count = 0
@@ -1509,15 +1491,7 @@ relationships 可选: [{{"from": "entry_id", "to": "entry_id", "type": "social_c
         )
         raw = response.choices[0].message.content or ""
         try:
-            if "```json" in raw:
-                raw = raw[raw.index("```json") + 7:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            elif "```" in raw:
-                raw = raw[raw.index("```") + 3:]
-                if "```" in raw:
-                    raw = raw[:raw.index("```")]
-            data = json.loads(raw.strip())
+            data = parse_json_block(raw)
             entries_data = data.get("entries", [])
 
             tagged = 0
@@ -1685,15 +1659,7 @@ async def _llm_confirm_cluster(candidates: dict[str, list]) -> int:
             )
             raw = response.choices[0].message.content or ""
             try:
-                if "```json" in raw:
-                    raw = raw[raw.index("```json") + 7:]
-                    if "```" in raw:
-                        raw = raw[:raw.index("```")]
-                elif "```" in raw:
-                    raw = raw[raw.index("```") + 3:]
-                    if "```" in raw:
-                        raw = raw[:raw.index("```")]
-                data = json.loads(raw.strip())
+                data = parse_json_block(raw)
                 if data.get("is_cluster"):
                     # T041: 写入集群
                     name = data.get("name", f"集群_{tag_key}")
@@ -1933,6 +1899,124 @@ def _to_fuzzy_time(iso_str: str) -> str:
             return f"{years}年前"
     except Exception:
         return "以前"
+
+
+# ==================== Image Search (Spec 003) ====================
+
+async def set_image_entry(namespace: str, key: str, value: str) -> None:
+    """写入图片记忆条目并确保 entity_type='image'。
+
+    封装 entity_type 标注逻辑，避免调用方直接操作数据库。
+    """
+    async with _lock_key(namespace, key):
+        db = await _ensure_db()
+        await _set_impl(namespace, key, value)
+        # 更新 entity_type 为 image
+        await db.execute(
+            "UPDATE entries SET entity_type='image' WHERE namespace=? AND key=? AND expired=0",
+            (namespace, key),
+        )
+        await db.commit()
+
+
+async def search_images(
+    query: str,
+    user_id: str,
+    limit: int = 5,
+) -> list[dict]:
+    """搜索图片记忆实体（entity_type='image'）。
+
+    FTS5 搜索 description + opinion + tags，返回匹配的图片条目。
+
+    Args:
+        query: 搜索关键词
+        user_id: 用户 ID（用于 namespace 过滤）
+        limit: 最大返回条数
+
+    Returns:
+        图片条目列表
+    """
+    db = await _ensure_db()
+
+    ns_pattern = f"user/{user_id}/images/%"
+
+    # FTS5 搜索
+    try:
+        cursor = await db.execute(
+            """SELECT e.*, f.rank FROM entries e
+               INNER JOIN entries_fts f ON e.id = f.rowid
+               WHERE entries_fts MATCH ? AND e.namespace LIKE ?
+               AND e.expired = 0 AND e.corrected = 0 AND e.entity_type = 'image'
+               ORDER BY rank
+               LIMIT ?""",
+            (query, ns_pattern, limit),
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        rows = []
+
+    # LIKE 降级
+    if not rows:
+        keywords = [kw for kw in query.split() if len(kw) >= 1]
+        if keywords:
+            like_conditions = " OR ".join(["e.value LIKE ?"] * len(keywords))
+            like_params = [f"%{kw}%" for kw in keywords]
+            cursor = await db.execute(
+                f"""SELECT e.* FROM entries e
+                   WHERE e.namespace LIKE ? AND ({like_conditions})
+                   AND e.expired = 0 AND e.corrected = 0 AND e.entity_type = 'image'
+                   ORDER BY e.updated_at DESC
+                   LIMIT ?""",
+                (ns_pattern, *like_params, limit),
+            )
+            rows = await cursor.fetchall()
+        else:
+            cursor = await db.execute(
+                """SELECT e.* FROM entries e
+                   WHERE e.namespace LIKE ? AND e.value LIKE ?
+                   AND e.expired = 0 AND e.corrected = 0 AND e.entity_type = 'image'
+                   ORDER BY e.updated_at DESC
+                   LIMIT ?""",
+                (ns_pattern, f"%{query}%", limit),
+            )
+            rows = await cursor.fetchall()
+
+    return [dict(r) for r in rows]
+
+
+async def get_top_tags(limit: int = 10) -> list[str]:
+    """获取全局访问频率最高的 topic_tags。
+
+    用于自主搜索时选取兴趣话题。
+
+    Args:
+        limit: 返回标签数量
+
+    Returns:
+        标签列表，按出现频率降序
+    """
+    db = await _ensure_db()
+    cursor = await db.execute(
+        """SELECT topic_tags, access_count FROM entries
+           WHERE topic_tags IS NOT NULL AND topic_tags != '[]'
+           AND expired = 0
+           ORDER BY access_count DESC
+           LIMIT 200"""
+    )
+    rows = await cursor.fetchall()
+
+    tag_counts: dict[str, int] = {}
+    for r in rows:
+        try:
+            tags = json.loads(r["topic_tags"])
+            if isinstance(tags, list):
+                for t in tags:
+                    tag_counts[t] = tag_counts.get(t, 0) + r["access_count"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+    return [t for t, _ in sorted_tags[:limit]]
 
 
 # ==================== Status ====================

@@ -10,7 +10,6 @@
 """
 
 import json
-import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,11 +17,8 @@ from typing import Optional
 
 from config import SESSION_TTL, MAX_CONTEXT_ROUNDS, DEFAULT_SYSTEM_PROMPT
 
-logger = logging.getLogger("session")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[session] %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
+from log_config import get_logger
+logger = get_logger("session")
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_FILE = DATA_DIR / "sessions.json"
