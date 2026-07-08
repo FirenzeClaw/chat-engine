@@ -9,6 +9,7 @@ QQ Bot WebSocket 协议模块
 
 import asyncio
 import json
+import logging
 import time
 from typing import Callable, Awaitable, Set
 
@@ -17,6 +18,12 @@ import aiohttp
 from config import (
     QQ_BOT_APPID, QQ_BOT_SECRET, QQ_WS_URL, HEARTBEAT_INTERVAL,
 )
+
+logger = logging.getLogger("qq")
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("[QQ] %(message)s"))
+logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
 # Intents 位图
 # PUBLIC_GUILD_MESSAGES (1<<30): 频道 @ (AT_MESSAGE_CREATE)
@@ -52,7 +59,7 @@ async def _get_access_token() -> str:
             _access_token = data.get("access_token", "")
             expires = int(data.get("expires_in", 7200))
             _token_expires = time.time() + expires - 300
-            print(f"[QQ] access_token 已获取，有效期 {expires}s")
+            logger.info("access_token 已获取，有效期 %ds", expires)
             return _access_token
 
 
@@ -106,7 +113,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
     while True:
         try:
             async with session.ws_connect(QQ_WS_URL) as ws:
-                print(f"[QQ] WebSocket 已连接: {QQ_WS_URL}")
+                logger.info("WebSocket 已连接: %s", QQ_WS_URL)
 
                 state = "hello"
                 hello_interval = HEARTBEAT_INTERVAL
@@ -125,7 +132,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                     if state == "hello":
                         if op == 10:
                             hello_interval = data.get("d", {}).get("heartbeat_interval", 45000) / 1000
-                            print(f"[QQ] Hello received, heartbeat_interval={hello_interval}s")
+                            logger.info("Hello received, heartbeat_interval=%.2fs", hello_interval)
 
                             token = await _get_access_token()
                             if _session_id and _latest_s is not None:
@@ -136,7 +143,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                                         "seq": _latest_s,
                                     }
                                 })
-                                print(f"[QQ] 发送 Resume (session={_session_id[:8]}..., seq={_latest_s})")
+                                logger.info("发送 Resume (session=%s..., seq=%s)", _session_id[:8], _latest_s)
                                 state = "resume"
                             else:
                                 await ws.send_json({
@@ -147,30 +154,30 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                                         "properties": {}
                                     }
                                 })
-                                print(f"[QQ] 发送 Identify (intents={INTENTS})")
+                                logger.info("发送 Identify (intents=%d)", INTENTS)
                                 state = "identify"
 
                     # Phase 2: Ready / Resumed
                     elif state in ("identify", "resume"):
                         if op == 0 and data.get("t") == "READY":
                             _session_id = data.get("d", {}).get("session_id", "")
-                            print(f"[QQ] Ready, session_id={_session_id[:16]}...")
+                            logger.info("Ready, session_id=%s...", _session_id[:16])
                             state = "running"
                             hb_task = asyncio.create_task(_heartbeat(ws, hello_interval))
 
                         elif op == 0 and data.get("t") == "RESUMED":
-                            print("[QQ] Resumed, 开始补发遗漏事件")
+                            logger.info("Resumed, 开始补发遗漏事件")
                             state = "running"
                             hb_task = asyncio.create_task(_heartbeat(ws, hello_interval))
 
                         elif op == 9:
-                            print("[QQ] Invalid Session，重置状态后重连")
+                            logger.warning("Invalid Session，重置状态后重连")
                             _session_id = ""
                             _latest_s = None
                             break
 
                         elif op == 7:
-                            print("[QQ] 服务端要求重连")
+                            logger.info("服务端要求重连")
                             break
 
                     # Phase 3: Running
@@ -178,10 +185,10 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                         if op == 11:
                             pass
                         elif op == 7:
-                            print("[QQ] 服务端要求重连")
+                            logger.info("服务端要求重连")
                             break
                         elif op == 9:
-                            print("[QQ] Session 失效，重置后重连")
+                            logger.warning("Session 失效，重置后重连")
                             _session_id = ""
                             _latest_s = None
                             break
@@ -196,7 +203,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                                     continue
 
                                 unified_msg = _build_unified_msg(event_type, event_data)
-                                print(f"[QQ] 收到消息: {unified_msg['user_id']} -> {unified_msg['content'][:50]}")
+                                logger.info("收到消息: %s -> %s", unified_msg['user_id'], unified_msg['content'][:50])
                                 await on_message(unified_msg)
 
                 if hb_task:
@@ -207,7 +214,7 @@ async def run_qq_loop(on_message: Callable[[dict], Awaitable[None]]):
                         pass
 
         except Exception as e:
-            print(f"[QQ] WebSocket 断开: {e}，5秒后重连")
+            logger.warning("WebSocket 断开: %s，5秒后重连", e)
             await asyncio.sleep(5)
 
 

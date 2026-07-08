@@ -65,17 +65,23 @@ async def on_qq_message(unified_msg: dict):
         except Exception:
             ws_clients.discard(client)
 
-    # 协调器处理 → AI 回复
+    # 协调器处理 → AI 回复（包装异常处理，防止 task 异常被静默丢弃）
+    async def _safe_process(user_id, content, msg_metadata, send_reply):
+        try:
+            await process_qq_message(user_id, content, msg_metadata, send_reply)
+        except Exception:
+            logger.exception("消息处理任务异常: user=%s", user_id[:16])
+
     try:
         from orchestrator import process_qq_message
-        asyncio.create_task(process_qq_message(
+        asyncio.create_task(_safe_process(
             user_id=user_id,
             content=unified_msg.get("content", ""),
             msg_metadata=unified_msg,
             send_reply=send_qq_message,
         ))
     except Exception as e:
-        logger.exception("消息处理失败")
+        logger.exception("消息处理任务创建失败")
 
 
 # ==================== QQ 消息发送 ====================

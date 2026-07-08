@@ -234,6 +234,8 @@ async def evaluate(
         else:
             decision["should_follow_up"] = False
             decision["reason"] = "rate-limited"
+            logger.info("追答限速跳过: session=%s (已达 %d/h 上限)",
+                         session_id[:12], FOLLOW_UP_MAX_PER_HOUR)
 
     return decision
 

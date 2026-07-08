@@ -257,8 +257,12 @@ class ReplyScheduler:
 
         # 缓冲上限：丢弃最旧消息
         max_buffer = _get_config("REPLY_MAX_BUFFER", 20)
+        dropped = 0
         while len(actor.buffer) > max_buffer:
             actor.buffer.pop(0)
+            dropped += 1
+        if dropped:
+            logger.warning("buffer 溢出丢弃 %d 条: %s", dropped, actor.session_key)
 
         # LRU 淘汰：Actor 超限
         max_actors = _get_config("REPLY_MAX_ACTORS", 50)
@@ -271,16 +275,23 @@ class ReplyScheduler:
             actor.chime_at = None
             actor.priority = Priority.P1_AT
             actor.event.set()
+            logger.info("enqueue @: key=%s pri=P1_AT queue=%d",
+                        actor.session_key, len(actor.buffer))
             return
 
         # 焦虑词：跳过等待，立即触发
         if has_anxiety:
             actor._trigger_reason = "anxiety"
             actor.event.set()
+            logger.info("enqueue anxiety: key=%s pri=P2_ANXIETY word='%s'",
+                        actor.session_key, content[:20])
             return
 
         # 普通入队：唤醒等待中的 actor
         actor.event.set()
+        logger.debug("enqueue: key=%s pri=%s queue=%d state=%s",
+                      actor.session_key, priority.name, len(actor.buffer),
+                      actor.state.value)
 
     # ==================== Actor Management ====================
 
@@ -291,7 +302,7 @@ class ReplyScheduler:
             actor._send_reply = send_reply
             actor.task = asyncio.create_task(self._actor_loop(actor))
             self._actors[session_key] = actor
-            logger.debug("Actor 已创建: %s (group=%s)", session_key, is_group)
+            logger.info("Actor 已创建: %s (group=%s)", session_key, is_group)
         elif send_reply is not None:
             # 仅在传入有效回调时更新（防止 record_group_speaker 的 None 覆盖已存回调）
             self._actors[session_key]._send_reply = send_reply
@@ -305,7 +316,7 @@ class ReplyScheduler:
         victim = self._actors.pop(victim_key)
         if victim.task and not victim.task.done():
             victim.task.cancel()
-        logger.debug("LRU 淘汰 Actor: %s", victim_key)
+        logger.info("LRU 淘汰 Actor: %s ( actors=%d )", victim_key, len(self._actors))
 
     # ==================== Actor Loop (State Machine) ====================
 
@@ -352,6 +363,9 @@ class ReplyScheduler:
                         # === WAITING: 防抖窗口 ===
                         actor.state = ActorState.WAITING
                         wait_until = time.monotonic() + random.uniform(wait_min, wait_max)
+                        logger.debug("WAITING: key=%s window=%.1fs queue=%d",
+                                     actor.session_key, wait_until - time.monotonic(),
+                                     len(actor.buffer))
 
                         while time.monotonic() < wait_until:
                             remaining = wait_until - time.monotonic()
@@ -383,6 +397,7 @@ class ReplyScheduler:
 
                     # === QUEUED: 排队等待 Gate ===
                     actor.state = ActorState.QUEUED
+                    logger.debug("QUEUED: key=%s pri=%s", actor.session_key, actor.priority.name)
 
                     # 高优先级（P0-P2）不排队等待
                     if actor.priority <= Priority.P2_ANXIETY:
@@ -403,6 +418,9 @@ class ReplyScheduler:
                         try:
                             # === THINKING: 调用 LLM ===
                             actor.state = ActorState.THINKING
+                            logger.info("THINKING: key=%s pri=%s queue=%d",
+                                        actor.session_key, actor.priority.name,
+                                        len(actor.buffer))
                             await self._do_reply(actor)
                         finally:
                             actor.buffer.clear()
@@ -648,7 +666,7 @@ class ReplyScheduler:
                         if actor.task and not actor.task.done():
                             actor.task.cancel()
                         self._actors.pop(actor.session_key, None)
-                        logger.debug("清理空闲 Actor: %s", actor.session_key)
+                        logger.info("清理空闲 Actor: %s", actor.session_key)
 
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
