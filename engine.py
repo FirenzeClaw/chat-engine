@@ -48,6 +48,7 @@ async def _assemble_system_prompt(
     user_id: str,
     is_new_session: bool,
     user_message: str = "",
+    persona_level: str = "full",
 ) -> str:
     """组装 system prompt = persona + 相关记忆。
 
@@ -61,14 +62,23 @@ async def _assemble_system_prompt(
 
     parts: list[str] = []
 
-    # 1. 获取性格设定
+    # 1. 获取分层性格设定（"core" / "full" / "eval"）
     try:
         from memory_store import get as mem_get
-        persona_entry = await mem_get("global/persona", "core")
+        persona_entry = await mem_get("global/persona", persona_level)
         if persona_entry:
             parts.append(persona_entry["value"])
     except Exception:
         pass
+
+    # 2. 回退：分层不存在时尝试 core
+    if not parts and persona_level != "core":
+        try:
+            persona_entry = await mem_get("global/persona", "core")
+            if persona_entry:
+                parts.append(persona_entry["value"])
+        except Exception:
+            pass
 
     if not parts:
         parts.append(DEFAULT_SYSTEM_PROMPT)
@@ -134,6 +144,7 @@ async def _build_messages(
     user_message: str,
     user_id: str,
     image_urls: list[str] = None,
+    persona_level: str = "full",
 ) -> list[dict]:
     """构建发给 LLM 的完整 messages 数组。
 
@@ -144,7 +155,7 @@ async def _build_messages(
     import context_manager
 
     is_new = len(session.messages) == 0
-    system_prompt = await _assemble_system_prompt(user_id, is_new, user_message)
+    system_prompt = await _assemble_system_prompt(user_id, is_new, user_message, persona_level)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages += session.get_context()
@@ -234,6 +245,7 @@ async def chat(
     role: str = "fast",
     metadata: Optional[dict] = None,
     image_urls: list[str] = None,
+    persona_level: str = "full",
 ) -> dict:
     """发送消息并获取回复（辅脑/主脑可选）。
 
@@ -260,7 +272,7 @@ async def chat(
 
     # 构建上下文（实时拉取 persona + 记忆索引）
     try:
-        messages = await _build_messages(session, user_message, session_id, image_urls)
+        messages = await _build_messages(session, user_message, session_id, image_urls, persona_level)
     except Exception:
         # memory_store 不可用时降级为纯历史模式
         logger.exception("上下文组装失败，降级为纯历史模式")

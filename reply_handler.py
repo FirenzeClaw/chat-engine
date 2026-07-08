@@ -95,6 +95,7 @@ async def handle_reply(actor) -> None:
                         temperature=0.8,
                         max_tokens=128,
                         image_urls=None,
+                        persona_level="core",
                     )
                     fast_reply = fast_result["reply"]
                     if not fast_reply.startswith("[SKIP]") and not fast_reply.startswith("[SEARCH:"):
@@ -135,6 +136,7 @@ async def handle_reply(actor) -> None:
                 role="fast",
                 temperature=personality_style.get("temperature", 0.8),
                 image_urls=None,
+                persona_level="core",
             )
             reply = result["reply"]
 
@@ -180,7 +182,7 @@ async def evaluate_and_followup(
         persona_text = ""
         try:
             from memory_store import get as mem_get
-            entry = await mem_get("global/persona", "core")
+            entry = await mem_get("global/persona", "eval")
             if entry:
                 persona_text = entry["value"]
         except Exception:
