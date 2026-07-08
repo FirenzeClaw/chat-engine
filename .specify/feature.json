@@ -1,0 +1,17 @@
+{
+  "feature_directory": "specs/001-cognitive-architecture",
+  "spec_file": "specs/001-cognitive-architecture/spec.md",
+  "plan_file": "specs/001-cognitive-architecture/plan.md",
+  "short_name": "cognitive-architecture",
+  "phase": 1,
+  "created": "2026-07-08",
+  "artifacts": [
+    "spec.md",
+    "plan.md",
+    "research.md",
+    "data-model.md",
+    "contracts/memory-api.md",
+    "quickstart.md",
+    "checklists/requirements.md"
+  ]
+}

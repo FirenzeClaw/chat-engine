@@ -1,0 +1,20 @@
+# 环境
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时数据
+data/
+logs/
+server.pid
+botuser/memory.db*
+botuser/*/
+
+# 系统
+.DS_Store
+Thumbs.db

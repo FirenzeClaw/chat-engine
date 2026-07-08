@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QQ Bot - 消息中心</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+  header { background: #16213e; padding: 12px 20px; border-bottom: 1px solid #0f3460; display: flex; align-items: center; gap: 12px; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; background: #e94560; }
+  header .dot.online { background: #4caf50; }
+  header h1 { font-size: 16px; font-weight: 500; }
+  #messages { flex: 1; overflow-y: auto; padding: 12px; }
+  .msg { margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; background: #0f3460; max-width: 80%; }
+  .msg.user { margin-left: auto; background: #533483; }
+  .msg .meta { font-size: 11px; color: #a0a0c0; margin-bottom: 4px; }
+  .msg .content { font-size: 14px; line-height: 1.5; word-break: break-all; }
+  #reply-bar { padding: 12px 20px; background: #16213e; border-top: 1px solid #0f3460; display: flex; gap: 8px; }
+  #reply-bar input { flex: 1; padding: 8px 12px; border: 1px solid #0f3460; border-radius: 6px; background: #1a1a2e; color: #e0e0e0; font-size: 14px; outline: none; }
+  #reply-bar input:focus { border-color: #533483; }
+  #reply-bar button { padding: 8px 16px; background: #533483; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  #reply-bar button:hover { background: #6a45b0; }
+  .status { text-align: center; font-size: 12px; color: #666; padding: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="status-dot"></div>
+  <h1>QQ Bot 消息中心</h1>
+  <span class="status" id="status-text">连接中...</span>
+</header>
+<div id="messages"></div>
+<div id="reply-bar">
+  <input id="reply-input" type="text" placeholder="输入回复内容..." disabled />
+  <button id="reply-btn" disabled onclick="sendReply()">发送</button>
+</div>
+
+<script>
+let lastUserId = '';
+const dot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const msgDiv = document.getElementById('messages');
+const input = document.getElementById('reply-input');
+const btn = document.getElementById('reply-btn');
+
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => {
+    dot.classList.add('online');
+    statusText.textContent = '已连接';
+    input.disabled = false;
+    btn.disabled = false;
+  };
+  ws.onclose = () => {
+    dot.classList.remove('online');
+    statusText.textContent = '断开，3s 后重连...';
+    input.disabled = true;
+    btn.disabled = true;
+    setTimeout(connect, 3000);
+  };
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    const typeCn = { AT_MESSAGE_CREATE: '频道@', C2C_MESSAGE_CREATE: '单聊',
+      GROUP_AT_MESSAGE_CREATE: '群聊@', DIRECT_MESSAGE_CREATE: '频道私信' };
+    const typeName = typeCn[data.type] || data.type || '消息';
+    const el = document.createElement('div');
+    el.className = 'msg user';
+    el.innerHTML = `<div class="meta">[${typeName}] ${data.user_id || ''} · ${new Date(data.timestamp * 1000).toLocaleTimeString()}</div>
+                    <div class="content">${escapeHtml(data.content)}</div>`;
+    msgDiv.appendChild(el);
+    msgDiv.scrollTop = msgDiv.scrollHeight;
+    lastUserId = data.user_id;
+  };
+}
+
+function sendReply() {
+  const text = input.value.trim();
+  if (!text || !lastUserId) return;
+  ws.send(JSON.stringify({ type: 'manual_reply', user_id: lastUserId, content: text }));
+  const el = document.createElement('div');
+  el.className = 'msg';
+  el.innerHTML = `<div class="meta">[手动回复] → ${lastUserId}</div>
+                  <div class="content">${escapeHtml(text)}</div>`;
+  msgDiv.appendChild(el);
+  msgDiv.scrollTop = msgDiv.scrollHeight;
+  input.value = '';
+}
+
+function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+connect();
+</script>
+</body>
+</html>
